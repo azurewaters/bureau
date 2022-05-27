@@ -1,0 +1,23 @@
+{
+  "name": "bureau",
+  "version": "1.0.0",
+  "description": "Put all your files together and have them organised for you and made searchable.",
+  "main": "index.js",
+  "author": "azurewaters@gmail.com",
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "@parcel/transformer-elm": "2.5.0",
+    "autoprefixer": "^10.4.5",
+    "elm": "^0.19.1-5",
+    "parcel": "^2.5.0",
+    "postcss": "^8.4.12",
+    "tailwindcss": "^3.0.24"
+  },
+  "scripts": {
+    "start": "parcel ./src/index.html"
+  },
+  "dependencies": {
+    "firebase": "^9.6.11"
+  }
+}
