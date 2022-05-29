@@ -2,13 +2,11 @@ port module Main exposing (..)
 
 import Browser
 import File exposing (File)
-import Html exposing (Attribute, Html, button, div, h1, input, text)
+import Html exposing (Attribute, Html, button, div, input, text)
 import Html.Attributes exposing (classList, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Json.Decode as Decode exposing (Decoder, Error(..))
-import Json.Encode as Encode
-import Set
-import Time
+import Json.Encode as Encode exposing (Value)
 import Validate exposing (Validator)
 
 
@@ -28,36 +26,6 @@ type Screen
     | Display
 
 
-type StatusOfReport
-    = Uploading
-    | AnErrorOccurredWhileUploading
-    | Waiting
-    | Processing
-    | Processed
-    | AnErrorOccurredWhileProcessing
-
-
-type alias Report =
-    { id : String
-    , name : String
-    , date : Time.Posix
-    , status : StatusOfReport
-    , thumbnailPath : String
-    , readings : List Reading
-    }
-
-
-type Result
-    = Quantity Float
-    | Quality String
-
-
-type alias Reading =
-    { kind : String
-    , result : Result
-    }
-
-
 type FileError
     = None
     | InvalidFile
@@ -66,7 +34,7 @@ type FileError
 
 type alias FileToProcess =
     { id : Int
-    , file : Encode.Value
+    , file : Value
     , progress : Float
     , error : FileError --  For now, we don't worry about what error it was
     , path : String
@@ -98,42 +66,38 @@ type alias Model =
     , lastUsedFileId : Int
     , filesToProcess : List FileToProcess
     , searchTerm : String
-    , reports : List Report
-    , selectedReport : Maybe Report
     }
 
 
 init : flags -> ( Model, Cmd msg )
 init _ =
-    ( { screenToShow = Display
-      , email = ""
-      , password = ""
+    ( { screenToShow = Login
+      , email = "t@t.com"
+      , password = "tester"
       , loginErrors = []
       , fullName = ""
       , signUpErrors = []
       , lastUsedFileId = 0
       , filesToProcess = []
       , searchTerm = ""
-      , reports = []
-      , selectedReport = Nothing
       }
     , Cmd.none
     )
 
 
-type
-    Msg
-    --  Login and registration messages
-    = EmailTyped String
+type Msg
+    = --  Login and registration messages
+      EmailTyped String
     | PasswordTyped String
     | LoginButtonClicked
     | SignUpButtonOnLoginClicked
     | FullNameTyped String
     | SignUpButtonClicked
     | LoginButtonOnSignUpClicked
+    | CredentialsVerified Bool
       --  Reports messages
     | SearchTyped String
-    | FilesDropped (List Encode.Value)
+    | FilesDropped (List Value)
     | FileUploadProgressed FileUploadProgress
     | FileUploadErrored FileUploadError
     | FileUploadCompleted FileUploadCompletion
@@ -175,27 +139,30 @@ update msg model =
         LoginButtonOnSignUpClicked ->
             ( { model | screenToShow = Login }, Cmd.none )
 
+        CredentialsVerified value ->
+            ( { model
+                | screenToShow =
+                    if value then
+                        Display
+
+                    else
+                        Login
+              }
+            , Cmd.none
+            )
+
         SearchTyped value ->
             ( { model | searchTerm = value }, Cmd.none )
 
         FilesDropped files ->
             let
-                admissibleFiles : List Encode.Value
-                admissibleFiles =
-                    files
-                        |> List.filter
-                            (\file ->
-                                case decodeFile file of
-                                    Just f ->
-                                        List.member (File.mime f) [ "image/png", "image/jpeg", "application/pdf" ]
-
-                                    Nothing ->
-                                        False
-                            )
+                imageFiles : List Value
+                imageFiles =
+                    List.filter checkIfImageFile files
 
                 fileIds : List Int
                 fileIds =
-                    List.range (model.lastUsedFileId + 1) (model.lastUsedFileId + List.length admissibleFiles)
+                    List.range (model.lastUsedFileId + 1) (model.lastUsedFileId + List.length imageFiles)
 
                 filesToProcess : List FileToProcess
                 filesToProcess =
@@ -209,11 +176,19 @@ update msg model =
                             }
                         )
                         fileIds
-                        admissibleFiles
+                        imageFiles
 
                 commandsToProcessFiles : List (Cmd msg)
                 commandsToProcessFiles =
-                    List.map (\fileToProcess -> processAFile { id = fileToProcess.id, file = fileToProcess.file }) filesToProcess
+                    List.map
+                        (\fileToProcess ->
+                            Encode.object
+                                [ ( "id", Encode.int fileToProcess.id )
+                                , ( "file", fileToProcess.file )
+                                ]
+                                |> processAFile
+                        )
+                        filesToProcess
             in
             ( { model
                 | filesToProcess = List.append model.filesToProcess filesToProcess
@@ -277,6 +252,16 @@ update msg model =
             ( model, Cmd.none )
 
 
+checkIfImageFile : Value -> Bool
+checkIfImageFile file =
+    case decodeFile file of
+        Just f ->
+            List.member (File.mime f) [ "image/png", "image/jpeg", "application/pdf" ]
+
+        Nothing ->
+            False
+
+
 loginValidator : Validator String Model
 loginValidator =
     Validate.firstError
@@ -295,7 +280,7 @@ signUpValidator =
         ]
 
 
-decodeFile : Encode.Value -> Maybe File
+decodeFile : Value -> Maybe File
 decodeFile value =
     case Decode.decodeValue File.decoder value of
         Ok f ->
@@ -303,6 +288,11 @@ decodeFile value =
 
         Err _ ->
             Nothing
+
+
+
+-- Ports
+-- Port Outs
 
 
 port signInAUser :
@@ -313,16 +303,23 @@ port signInAUser :
 port registerAUser : { email : String, name : String } -> Cmd msg
 
 
-port processAFile : { id : Int, file : Encode.Value } -> Cmd msg
+port processAFile : Value -> Cmd msg
 
 
-port uploadProgress : (Encode.Value -> msg) -> Sub msg
+
+-- Port Ins
 
 
-port uploadError : (Encode.Value -> msg) -> Sub msg
+port credentialsVerified : (Bool -> msg) -> Sub msg
 
 
-port uploadComplete : (Encode.Value -> msg) -> Sub msg
+port uploadProgress : (Value -> msg) -> Sub msg
+
+
+port uploadError : (Value -> msg) -> Sub msg
+
+
+port uploadComplete : (Value -> msg) -> Sub msg
 
 
 fileUploadProgressDecoder : Decoder FileUploadProgress
@@ -332,7 +329,7 @@ fileUploadProgressDecoder =
         (Decode.field "progress" Decode.float)
 
 
-decodeFileUploadProgress : Encode.Value -> Msg
+decodeFileUploadProgress : Value -> Msg
 decodeFileUploadProgress value =
     case Decode.decodeValue fileUploadProgressDecoder value of
         Ok fileUploadProgress ->
@@ -348,7 +345,7 @@ fileUploadErroredDecoder =
         (Decode.field "id" Decode.int)
 
 
-decodeFileUploadError : Encode.Value -> Msg
+decodeFileUploadError : Value -> Msg
 decodeFileUploadError value =
     case Decode.decodeValue fileUploadErroredDecoder value of
         Ok fileUploadError ->
@@ -365,7 +362,7 @@ fileUploadCompletionDecoder =
         (Decode.field "path" Decode.string)
 
 
-decodeFileUploadCompletion : Encode.Value -> Msg
+decodeFileUploadCompletion : Value -> Msg
 decodeFileUploadCompletion value =
     case Decode.decodeValue fileUploadCompletionDecoder value of
         Ok fileUploadCompletion ->
@@ -379,7 +376,7 @@ subscriptions : Model -> Sub Msg
 subscriptions model =
     case model.screenToShow of
         Login ->
-            Sub.none
+            Sub.batch [ credentialsVerified CredentialsVerified ]
 
         SignUp ->
             Sub.none
@@ -411,12 +408,12 @@ onDrop msg =
     preventDefaultOn "drop" (Decode.succeed ( msg, True ))
 
 
-onFilesDrop : (List Encode.Value -> Msg) -> Attribute Msg
+onFilesDrop : (List Value -> Msg) -> Attribute Msg
 onFilesDrop msg =
     preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
 
 
-filesDecoder : Decoder (List Encode.Value)
+filesDecoder : Decoder (List Value)
 filesDecoder =
     Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
 
@@ -483,15 +480,13 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDisplay model.filesToProcess
+        [ filesDropZone model.filesToProcess
         , input [ placeholder "Search", onInput SearchTyped ] []
-        , reportsDisplay model.reports
-        , readingsDisplay model.reports
         ]
 
 
-filesDisplay : List FileToProcess -> Html Msg
-filesDisplay filesToProcess =
+filesDropZone : List FileToProcess -> Html Msg
+filesDropZone filesToProcess =
     div
         [ onFilesDrop FilesDropped
         , onDragOver NoOp
@@ -501,49 +496,35 @@ filesDisplay filesToProcess =
 
 fileDisplay : FileToProcess -> Html Msg
 fileDisplay fileToProcess =
-    div []
+    div
+        []
         [ fileToProcess.id |> String.fromInt |> text
         , text " - "
-        , fileToProcess.progress |> String.fromFloat |> text
+        , uploadStatus fileToProcess.progress fileToProcess.error |> text
         ]
 
 
-reportsDisplay : List Report -> Html Msg
-reportsDisplay reports =
-    div []
-        [ h1 [] [ text "Reports display" ]
-        , div
-            []
-            (reports
-                |> List.sortBy (\a -> a.date |> Time.posixToMillis)
-                |> List.map reportDisplay
+uploadStatus : Float -> FileError -> String
+uploadStatus progress error =
+    case progress * 100 |> round of
+        0 ->
+            case error of
+                None ->
+                    "Starting upload"
+
+                InvalidFile ->
+                    "This is not a valid file and will not be uploaded"
+
+                UploadError ->
+                    "Couldn't upload"
+
+        100 ->
+            "Uploaded"
+
+        _ ->
+            (progress
+                |> (*) 100
+                |> round
+                |> String.fromInt
             )
-        ]
-
-
-reportDisplay : Report -> Html Msg
-reportDisplay report =
-    div []
-        [ div [] [ report.date |> Time.posixToMillis |> String.fromInt |> text ]
-        , div [] [ text report.name ]
-        ]
-
-
-readingsDisplay : List Report -> Html Msg
-readingsDisplay reports =
-    let
-        --  Firstly, get all the values from all the reports
-        --  Make a unique set of reading kinds
-        kinds : List String
-        kinds =
-            reports
-                |> List.map (\report -> List.map (\reading -> reading.kind) report.readings)
-                |> List.concat
-                |> Set.fromList
-                |> Set.toList
-                |> List.sort
-    in
-    div []
-        [ div [] (List.map (\kind -> div [] [ text kind ]) kinds)
-        , div [] [ text "Graph" ]
-        ]
+                ++ "% uploaded"

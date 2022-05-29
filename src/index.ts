@@ -31,7 +31,7 @@ main.ports.processAFile.subscribe(processAFile)
 function signInAUser(credentials: { email: string, password: string }) {
   signInWithEmailAndPassword(fbAuth, credentials.email, credentials.password)
     .then((authenticatedUser) => {
-      main.ports.credentialsVerified
+      main.ports.credentialsVerified.send(true)
     })
     .catch((error) => {
       main.ports.fbError.send(error)
@@ -43,7 +43,7 @@ function registerAUser(details: { email: string, password: string }) {
   throw new Error("Function not implemented.")
 }
 
-function processAFile(fileToProcess: { id: Number, file: File, progress: Number }) {
+function processAFile(fileToProcess: { id: Number, file: File }) {
   //  This is where we upload a file to Firebase Storage and then record its path in the database.
   if (fbAuth.currentUser) {
     let userId = fbAuth.currentUser.uid
