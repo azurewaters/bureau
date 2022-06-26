@@ -1,16 +1,17 @@
 port module Main exposing (..)
 
 import Browser
-import File exposing (File)
+import File
 import Html exposing (Attribute, Html, button, div, input, text)
-import Html.Attributes exposing (classList, placeholder, required, type_, value)
+import Html.Attributes exposing (classList, placeholder, property, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Json.Decode as Decode exposing (Decoder, Error(..))
 import Json.Encode as Encode exposing (Value)
+import Time exposing (Posix)
 import Validate exposing (Validator)
 
 
-main : Program () Model Msg
+main : Program Value Model Msg
 main =
     Browser.element
         { init = init
@@ -26,18 +27,27 @@ type Screen
     | Display
 
 
-type FileError
-    = None
-    | InvalidFile
-    | UploadError
+type alias Errors =
+    List String
 
 
-type alias FileToProcess =
+type alias FileStoragePath =
+    String
+
+
+type FileUploadStatus
+    = Uploading Float
+    | Completed
+    | Error String
+
+
+type alias FileBeingProcessed =
     { id : Int
-    , file : Value
-    , progress : Float
-    , error : FileError --  For now, we don't worry about what error it was
-    , path : String
+    , name : String
+    , size : Int
+    , mime : String
+    , value : Value
+    , uploadStatus : FileUploadStatus
     }
 
 
@@ -50,36 +60,61 @@ type alias FileUploadError =
 
 
 type alias FileUploadCompletion =
-    { id : Int, path : String }
+    { id : Int }
 
 
-type alias Model =
-    { -- Login and Sign up stuff
-      screenToShow : Screen
-    , email : String
-    , password : String
-    , loginErrors : List String
-    , fullName : String
-    , signUpErrors : List String
-
-    --  Reports display stuff
-    , lastUsedFileId : Int
-    , filesToProcess : List FileToProcess
-    , searchTerm : String
+type alias Report =
+    { id : String
+    , name : String
+    , size : Int
+    , mime : String
+    , uploadedOn : Posix
     }
 
 
-init : flags -> ( Model, Cmd msg )
-init _ =
-    ( { screenToShow = Login
+type alias Reports =
+    List Report
+
+
+type alias Model =
+    { -- Objects from JS
+      pdfjs : Value
+
+    -- Login and Sign up stuff
+    , screenToShow : Screen
+    , email : String
+    , password : String
+    , loginErrors : Errors
+    , fullName : String
+    , signUpErrors : Errors
+    , currentUsersId : String
+
+    --  Reports display stuff
+    , reports : Reports
+    , lastUsedFileId : Int
+    , filesBeingProcessed : List FileBeingProcessed
+    , searchTerm : String
+
+    -- Other
+    , textInFile : String
+    }
+
+
+init : Value -> ( Model, Cmd msg )
+init pdfjs =
+    ( { pdfjs = pdfjs
+      , screenToShow = Login
       , email = "t@t.com"
       , password = "tester"
       , loginErrors = []
       , fullName = ""
       , signUpErrors = []
+      , currentUsersId = ""
+      , reports = []
       , lastUsedFileId = 0
-      , filesToProcess = []
+      , filesBeingProcessed = []
       , searchTerm = ""
+      , textInFile = ""
       }
     , Cmd.none
     )
@@ -94,14 +129,15 @@ type Msg
     | FullNameTyped String
     | SignUpButtonClicked
     | LoginButtonOnSignUpClicked
-    | CredentialsVerified Bool
+    | CredentialsVerified String
       --  Reports messages
-    | SearchTyped String
+    | ReportsFetched Reports
     | FilesDropped (List Value)
     | FileUploadProgressed FileUploadProgress
     | FileUploadErrored FileUploadError
     | FileUploadCompleted FileUploadCompletion
       --  Miscellaneous
+    | GotTextInFile String
     | NoOp
 
 
@@ -141,42 +177,61 @@ update msg model =
 
         CredentialsVerified value ->
             ( { model
-                | screenToShow =
-                    if value then
+                | currentUsersId = value
+                , screenToShow =
+                    if value /= "" then
                         Display
 
                     else
                         Login
               }
-            , Cmd.none
+            , fetchTheUsersReports value
             )
 
-        SearchTyped value ->
-            ( { model | searchTerm = value }, Cmd.none )
-
-        FilesDropped files ->
+        ReportsFetched reports ->
             let
-                imageFiles : List Value
-                imageFiles =
-                    List.filter checkIfImageFile files
+                _ =
+                    Debug.log "ReportsFetched"
+            in
+            ( { model | reports = reports }, Cmd.none )
+
+        FilesDropped values ->
+            let
+                uniqueImageValues : List Value
+                uniqueImageValues =
+                    values
+                        |> List.filter checkIfFileIsAnImage
+                        |> List.filter (checkIfFileIsAlreadyBeingProcessed model.filesBeingProcessed)
 
                 fileIds : List Int
                 fileIds =
-                    List.range (model.lastUsedFileId + 1) (model.lastUsedFileId + List.length imageFiles)
+                    List.range (model.lastUsedFileId + 1) (List.length uniqueImageValues + model.lastUsedFileId)
 
-                filesToProcess : List FileToProcess
+                filesToProcess : List FileBeingProcessed
                 filesToProcess =
-                    List.map2
-                        (\index file ->
-                            { id = index
-                            , file = file
-                            , progress = 0
-                            , error = None
-                            , path = ""
-                            }
+                    List.indexedMap
+                        (\index value ->
+                            case Decode.decodeValue File.decoder value of
+                                Ok file ->
+                                    { id = model.lastUsedFileId + index
+                                    , name = File.name file
+                                    , size = File.size file
+                                    , mime = File.mime file
+                                    , value = value
+                                    , uploadStatus = Uploading 0.0
+                                    }
+
+                                Err _ ->
+                                    { id = -1
+                                    , name = ""
+                                    , size = 0
+                                    , mime = ""
+                                    , value = value
+                                    , uploadStatus = Error "Could not decode file"
+                                    }
                         )
-                        fileIds
-                        imageFiles
+                        uniqueImageValues
+                        |> List.filter (\f -> f.id > -1)
 
                 commandsToProcessFiles : List (Cmd msg)
                 commandsToProcessFiles =
@@ -184,14 +239,14 @@ update msg model =
                         (\fileToProcess ->
                             Encode.object
                                 [ ( "id", Encode.int fileToProcess.id )
-                                , ( "file", fileToProcess.file )
+                                , ( "file", fileToProcess.value )
                                 ]
                                 |> processAFile
                         )
                         filesToProcess
             in
             ( { model
-                | filesToProcess = List.append model.filesToProcess filesToProcess
+                | filesBeingProcessed = List.append model.filesBeingProcessed filesToProcess
                 , lastUsedFileId = List.maximum fileIds |> Maybe.withDefault 0
               }
             , Cmd.batch commandsToProcessFiles
@@ -199,66 +254,79 @@ update msg model =
 
         FileUploadProgressed fileUploadProgress ->
             let
-                updateIfCorrectFile : FileUploadProgress -> FileToProcess -> FileToProcess
+                updateIfCorrectFile : FileUploadProgress -> FileBeingProcessed -> FileBeingProcessed
                 updateIfCorrectFile progress file =
                     if file.id == progress.id then
-                        { file | progress = progress.progress }
+                        { file | uploadStatus = Uploading progress.progress }
 
                     else
                         file
 
-                updatedFilesToProcess : List FileToProcess
+                updatedFilesToProcess : List FileBeingProcessed
                 updatedFilesToProcess =
-                    model.filesToProcess
+                    model.filesBeingProcessed
                         |> List.map (updateIfCorrectFile fileUploadProgress)
             in
-            ( { model | filesToProcess = updatedFilesToProcess }, Cmd.none )
+            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
 
         FileUploadErrored fileUploadError ->
             let
-                updateIfCorrectFile : FileUploadError -> FileToProcess -> FileToProcess
+                updateIfCorrectFile : FileUploadError -> FileBeingProcessed -> FileBeingProcessed
                 updateIfCorrectFile error file =
                     if file.id == error.id then
-                        { file | error = UploadError }
+                        { file | uploadStatus = Error "" }
 
                     else
                         file
 
-                updatedFilesToProcess : List FileToProcess
+                updatedFilesToProcess : List FileBeingProcessed
                 updatedFilesToProcess =
-                    model.filesToProcess
+                    model.filesBeingProcessed
                         |> List.map (updateIfCorrectFile fileUploadError)
             in
-            ( { model | filesToProcess = updatedFilesToProcess }, Cmd.none )
+            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
 
         FileUploadCompleted fileUploadCompletion ->
             let
-                updateIfCorrectFile : FileUploadCompletion -> FileToProcess -> FileToProcess
+                updateIfCorrectFile : FileUploadCompletion -> FileBeingProcessed -> FileBeingProcessed
                 updateIfCorrectFile completion file =
                     if file.id == completion.id then
-                        { file | progress = 1, path = completion.path }
+                        { file | uploadStatus = Completed }
 
                     else
                         file
 
-                updatedFilesToProcess : List FileToProcess
+                updatedFilesToProcess : List FileBeingProcessed
                 updatedFilesToProcess =
-                    model.filesToProcess
+                    model.filesBeingProcessed
                         |> List.map (updateIfCorrectFile fileUploadCompletion)
             in
-            ( { model | filesToProcess = updatedFilesToProcess }, Cmd.none )
+            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
+
+        GotTextInFile t ->
+            ( { model | textInFile = t }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
 
 
-checkIfImageFile : Value -> Bool
-checkIfImageFile file =
-    case decodeFile file of
-        Just f ->
-            List.member (File.mime f) [ "image/png", "image/jpeg", "application/pdf" ]
+checkIfFileIsAnImage : Value -> Bool
+checkIfFileIsAnImage value =
+    case Decode.decodeValue File.decoder value of
+        Ok file ->
+            List.member (File.mime file) [ "image/png", "image/jpeg", "application/pdf" ]
 
-        Nothing ->
+        _ ->
+            False
+
+
+checkIfFileIsAlreadyBeingProcessed : List FileBeingProcessed -> Value -> Bool
+checkIfFileIsAlreadyBeingProcessed filesAlreadyBeingProcessed value =
+    case Decode.decodeValue File.decoder value of
+        Ok file ->
+            List.all (\fbp -> fbp.name /= File.name file) filesAlreadyBeingProcessed
+
+        _ ->
             False
 
 
@@ -280,16 +348,6 @@ signUpValidator =
         ]
 
 
-decodeFile : Value -> Maybe File
-decodeFile value =
-    case Decode.decodeValue File.decoder value of
-        Ok f ->
-            Just f
-
-        Err _ ->
-            Nothing
-
-
 
 -- Ports
 -- Port Outs
@@ -306,11 +364,14 @@ port registerAUser : { email : String, name : String } -> Cmd msg
 port processAFile : Value -> Cmd msg
 
 
+port fetchedUsersReports : (Value -> msg) -> Sub msg
+
+
 
 -- Port Ins
 
 
-port credentialsVerified : (Bool -> msg) -> Sub msg
+port credentialsVerified : (String -> msg) -> Sub msg
 
 
 port uploadProgress : (Value -> msg) -> Sub msg
@@ -320,6 +381,9 @@ port uploadError : (Value -> msg) -> Sub msg
 
 
 port uploadComplete : (Value -> msg) -> Sub msg
+
+
+port fetchTheUsersReports : String -> Cmd msg
 
 
 fileUploadProgressDecoder : Decoder FileUploadProgress
@@ -357,9 +421,8 @@ decodeFileUploadError value =
 
 fileUploadCompletionDecoder : Decoder FileUploadCompletion
 fileUploadCompletionDecoder =
-    Decode.map2 FileUploadCompletion
+    Decode.map FileUploadCompletion
         (Decode.field "id" Decode.int)
-        (Decode.field "path" Decode.string)
 
 
 decodeFileUploadCompletion : Value -> Msg
@@ -367,6 +430,31 @@ decodeFileUploadCompletion value =
     case Decode.decodeValue fileUploadCompletionDecoder value of
         Ok fileUploadCompletion ->
             FileUploadCompleted fileUploadCompletion
+
+        Err _ ->
+            NoOp
+
+
+reportDecoder : Decoder Report
+reportDecoder =
+    Decode.map5 Report
+        (Decode.field "id" Decode.string)
+        (Decode.field "name" Decode.string)
+        (Decode.field "size" Decode.int)
+        (Decode.field "mime" Decode.string)
+        (Decode.field "uploadedOn" Decode.int |> Decode.map Time.millisToPosix)
+
+
+reportsDecoder : Decoder Reports
+reportsDecoder =
+    Decode.list reportDecoder
+
+
+decodeReports : Value -> Msg
+decodeReports value =
+    case Decode.decodeValue reportsDecoder value of
+        Ok reports ->
+            ReportsFetched reports
 
         Err _ ->
             NoOp
@@ -383,7 +471,8 @@ subscriptions model =
 
         Display ->
             Sub.batch
-                [ uploadProgress decodeFileUploadProgress
+                [ fetchedUsersReports decodeReports
+                , uploadProgress decodeFileUploadProgress
                 , uploadError decodeFileUploadError
                 , uploadComplete decodeFileUploadCompletion
                 ]
@@ -480,51 +569,130 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDropZone model.filesToProcess
-        , input [ placeholder "Search", onInput SearchTyped ] []
+        [ filesDropZone model.pdfjs model.filesBeingProcessed
+        , text model.textInFile
+        , reportsDisplay model.reports
         ]
 
 
-filesDropZone : List FileToProcess -> Html Msg
-filesDropZone filesToProcess =
+filesDropZone : Value -> List FileBeingProcessed -> Html Msg
+filesDropZone pdfjs filesToProcess =
     div
         [ onFilesDrop FilesDropped
         , onDragOver NoOp
         ]
-        (List.append [ div [] [ text "Drag a report here to upload" ] ] (List.map fileDisplay filesToProcess))
+        (List.concat
+            [ [ div [] [ text "Drag a report here to upload" ] ]
+            , List.map fileDisplay filesToProcess
+            , List.map (textGetter pdfjs) filesToProcess
+            ]
+        )
 
 
-fileDisplay : FileToProcess -> Html Msg
+fileDisplay : FileBeingProcessed -> Html Msg
 fileDisplay fileToProcess =
     div
         []
         [ fileToProcess.id |> String.fromInt |> text
         , text " - "
-        , uploadStatus fileToProcess.progress fileToProcess.error |> text
+        , getUploadStatus fileToProcess |> text
         ]
 
 
-uploadStatus : Float -> FileError -> String
-uploadStatus progress error =
-    case progress * 100 |> round of
-        0 ->
-            case error of
-                None ->
-                    "Starting upload"
+getUploadStatus : FileBeingProcessed -> String
+getUploadStatus fileToProcess =
+    case fileToProcess.uploadStatus of
+        Uploading progress ->
+            (round progress |> String.fromInt) ++ "% uploaded"
 
-                InvalidFile ->
-                    "This is not a valid file and will not be uploaded"
-
-                UploadError ->
-                    "Couldn't upload"
-
-        100 ->
+        Completed ->
             "Uploaded"
 
-        _ ->
-            (progress
-                |> (*) 100
-                |> round
-                |> String.fromInt
+        Error _ ->
+            "Problem uploading"
+
+
+textGetter : Value -> FileBeingProcessed -> Html Msg
+textGetter pdfjs fileToProcess =
+    Html.node "text-getter"
+        [ property "pdfjs" pdfjs
+        , property "fileId" (Encode.int fileToProcess.id)
+        , property "file" fileToProcess.value
+        , Html.Events.on "gotText"
+            (Decode.map GotTextInFile <|
+                Decode.at [ "details", "text" ] Decode.string
             )
-                ++ "% uploaded"
+        ]
+        []
+
+
+reportsDisplay : Reports -> Html Msg
+reportsDisplay reports =
+    div
+        []
+        (div [] [ text "Reports" ] :: List.map reportDisplay reports)
+
+
+reportDisplay : Report -> Html Msg
+reportDisplay report =
+    div
+        []
+        [ text report.name
+        , div []
+            [ text
+                (String.join " : "
+                    [ report.size |> String.fromInt
+                    , report.uploadedOn |> getDateFromPosix
+                    ]
+                )
+            ]
+        ]
+
+
+getDateFromPosix : Posix -> String
+getDateFromPosix posix =
+    String.join " "
+        [ Time.toYear Time.utc posix |> String.fromInt
+        , Time.toMonth Time.utc posix |> getMonthNameFromMonth
+        , Time.toDay Time.utc posix |> String.fromInt
+        ]
+
+
+getMonthNameFromMonth : Time.Month -> String
+getMonthNameFromMonth month =
+    case month of
+        Time.Jan ->
+            "Jan"
+
+        Time.Feb ->
+            "Feb"
+
+        Time.Mar ->
+            "Mar"
+
+        Time.Apr ->
+            "Apr"
+
+        Time.May ->
+            "May"
+
+        Time.Jun ->
+            "Jun"
+
+        Time.Jul ->
+            "Jul"
+
+        Time.Aug ->
+            "Aug"
+
+        Time.Sep ->
+            "Sep"
+
+        Time.Oct ->
+            "Oct"
+
+        Time.Nov ->
+            "Nov"
+
+        Time.Dec ->
+            "Dec"
