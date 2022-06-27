@@ -5,13 +5,14 @@ import File
 import Html exposing (Attribute, Html, button, div, input, text)
 import Html.Attributes exposing (classList, placeholder, property, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
+import Html.Keyed
 import Json.Decode as Decode exposing (Decoder, Error(..))
 import Json.Encode as Encode exposing (Value)
 import Time exposing (Posix)
 import Validate exposing (Validator)
 
 
-main : Program Value Model Msg
+main : Program Flags Model Msg
 main =
     Browser.element
         { init = init
@@ -19,6 +20,14 @@ main =
         , update = update
         , view = view
         }
+
+
+type alias Flags =
+    { pdfjs : Value
+    , fbAuth : Value
+    , fbStore : Value
+    , fbStorage : Value
+    }
 
 
 type Screen
@@ -78,7 +87,7 @@ type alias Reports =
 
 type alias Model =
     { -- Objects from JS
-      pdfjs : Value
+      flags : Flags
 
     -- Login and Sign up stuff
     , screenToShow : Screen
@@ -100,9 +109,9 @@ type alias Model =
     }
 
 
-init : Value -> ( Model, Cmd msg )
-init pdfjs =
-    ( { pdfjs = pdfjs
+init : Flags -> ( Model, Cmd msg )
+init flags =
+    ( { flags = flags
       , screenToShow = Login
       , email = "t@t.com"
       , password = "tester"
@@ -569,7 +578,7 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDropZone model.pdfjs model.filesBeingProcessed
+        [ filesDropZone model.flags.pdfjs model.filesBeingProcessed
         , text model.textInFile
         , reportsDisplay model.reports
         ]
@@ -584,7 +593,7 @@ filesDropZone pdfjs filesToProcess =
         (List.concat
             [ [ div [] [ text "Drag a report here to upload" ] ]
             , List.map fileDisplay filesToProcess
-            , List.map (textGetter pdfjs) filesToProcess
+            , [ keyedTextGetters pdfjs filesToProcess ]
             ]
         )
 
@@ -610,6 +619,17 @@ getUploadStatus fileToProcess =
 
         Error _ ->
             "Problem uploading"
+
+
+keyedTextGetters : Value -> List FileBeingProcessed -> Html Msg
+keyedTextGetters pdfjs filesToProcess =
+    Html.Keyed.node
+        "div"
+        []
+        (List.map
+            (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter pdfjs fileToProcess))
+            filesToProcess
+        )
 
 
 textGetter : Value -> FileBeingProcessed -> Html Msg

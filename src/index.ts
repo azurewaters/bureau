@@ -15,6 +15,7 @@ import { Report, reportConverter } from "./Report"
 
 import * as pdfjs from "pdfjs-dist"
 
+//  Set up pdfjs
 pdfjs.GlobalWorkerOptions.workerSrc =
   "https://cdn.jsdelivr.net/npm/pdfjs-dist@2.14.305/build/pdf.worker.min.js"
 
@@ -35,7 +36,12 @@ const fbStorage = getStorage()
 //  Initialise everything
 const main = Elm.Main.init({
   node: document.getElementsByTagName("main")[0],
-  flags: pdfjs,
+  flags: {
+    pdfjs: pdfjs,
+    fbAuth: fbAuth,
+    fbStore: fbStore,
+    fbStorage: fbStorage,
+  },
 })
 
 //  Connect up the ports
