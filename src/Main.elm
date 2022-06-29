@@ -3,7 +3,7 @@ port module Main exposing (..)
 import Browser
 import File exposing (File)
 import Html exposing (Attribute, Html, button, div, input, text)
-import Html.Attributes exposing (classList, placeholder, property, required, type_, value)
+import Html.Attributes exposing (class, placeholder, property, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Html.Keyed
 import Json.Decode as Decode exposing (Decoder, Error(..))
@@ -439,24 +439,6 @@ onDragEnd msg =
     on "dragend" (Decode.succeed msg)
 
 
-classes : String -> Html.Attribute msg
-classes stringOfClasses =
-    stringOfClasses
-        |> String.split " "
-        |> List.map (\x -> ( x, True ))
-        |> classList
-
-
-inputClasses : Html.Attribute msg
-inputClasses =
-    classes "border border-gray-300 rounded px-4 py-2"
-
-
-buttonClasses : Html.Attribute msg
-buttonClasses =
-    classes "bg-gray-900 border border-gray-900 rounded px-4 py-2 text-white font-semibold"
-
-
 view : Model -> Html Msg
 view model =
     case model.screenToShow of
@@ -473,10 +455,10 @@ view model =
 login : Model -> Html Msg
 login model =
     div []
-        [ input [ type_ "email", required True, placeholder "Your email address", inputClasses, onInput EmailTyped, value model.email ] []
-        , input [ type_ "password", required True, placeholder "Your password", inputClasses, onInput PasswordTyped, value model.password ] []
-        , button [ onClick SignUpButtonOnLoginClicked, buttonClasses ] [ text "Sign Up" ]
-        , button [ onClick LoginButtonClicked, buttonClasses ] [ text "Login" ]
+        [ input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
+        , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
+        , button [ onClick SignUpButtonOnLoginClicked, class "btn" ] [ text "Sign Up" ]
+        , button [ onClick LoginButtonClicked, class "btn btn-primary" ] [ text "Login" ]
         , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
         ]
 
@@ -484,10 +466,10 @@ login model =
 signUp : Model -> Html Msg
 signUp model =
     div []
-        [ input [ type_ "email", required True, placeholder "Your email address", inputClasses, onInput EmailTyped, value model.email ] []
-        , input [ type_ "string", required True, placeholder "Your full name", inputClasses, onInput FullNameTyped, value model.fullName ] []
-        , button [ onClick LoginButtonOnSignUpClicked, buttonClasses ] [ text "Login" ]
-        , button [ onClick SignUpButtonClicked, buttonClasses ] [ text "Sign up" ]
+        [ input [ type_ "email", required True, placeholder "Your email address", class "input", onInput EmailTyped, value model.email ] []
+        , input [ type_ "string", required True, placeholder "Your full name", class "input", onInput FullNameTyped, value model.fullName ] []
+        , button [ onClick LoginButtonOnSignUpClicked, class "btn btn-primary" ] [ text "Login" ]
+        , button [ onClick SignUpButtonClicked, class "btn" ] [ text "Sign up" ]
         , div [] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
         ]
 
