@@ -20,6 +20,7 @@
     "start": "parcel ./src/index.html"
   },
   "dependencies": {
+    "@microsoft/fast-element": "^1.10.2",
     "firebase": "^9.6.11",
     "pdfjs-dist": "^2.14.305"
   }

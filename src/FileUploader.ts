@@ -1,3 +1,4 @@
+import { FASTElement, customElement, observable } from "@microsoft/fast-element"
 import { Auth, User } from "firebase/auth"
 import {
   FirebaseStorage,
@@ -6,99 +7,75 @@ import {
   uploadBytesResumable,
 } from "firebase/storage"
 
-customElements.define(
-  "file-uploader",
-  class FileUploader extends HTMLElement {
-    //  Properties
-    private _user?: User
-    private _auth?: Auth
-    private _storage?: FirebaseStorage
-    private _fileId?: number
-    private _file?: File
+@customElement("file-uploader")
+export class FileUploader extends FASTElement {
+  @observable auth?: Auth //  Could have used @attr but since it is not a simple primitive that will be reflected in the attribute of the custom element, we are using observable
+  @observable storage?: FirebaseStorage
+  @observable fileId?: number
+  @observable file?: File
 
-    constructor() {
-      super()
-    }
+  constructor() {
+    super()
+    console.log("constructor")
+  }
 
-    connectedCallback() {
-      console.log("File Uploader - connectedCallback")
-      this._uploadFile()
-    }
+  connectedCallback() {
+    super.connectedCallback()
+    console.log("connected")
+  }
 
-    disconnectedCallback() {
-      console.log("File Uploader - disconnectedCallback")
-    }
+  authChanged() {
+    console.log("authChanged")
+    this.uploadTheFile()
+  }
 
-    set user(value: User) {
-      this._user = value
-      this._uploadFile()
-    }
+  storageChanged() {
+    console.log("storageChanged")
+    this.uploadTheFile()
+  }
 
-    set auth(value: Auth) {
-      this._auth = value
-      this._uploadFile()
-    }
+  fileIdChanged() {
+    console.log("fileIdChanged")
+    this.uploadTheFile()
+  }
 
-    set storage(value: FirebaseStorage) {
-      this._storage = value
-      this._uploadFile()
-    }
+  fileChanged() {
+    console.log("fileChanged")
+    this.uploadTheFile()
+  }
 
-    set fileId(value: number) {
-      this._fileId = value
-      this._uploadFile()
-    }
+  uploadTheFile() {
+    //  This is where we upload the file if all the properties we need have been sent in
+    if (this.auth?.currentUser?.uid && this.storage && this.file) {
+      let randomNumber = Math.floor(Math.random() * 100000)
+      let uploadFileRef = ref(
+        this.storage,
+        `${this.auth?.currentUser?.uid}/${randomNumber} - ${this.file.name}`
+      )
 
-    set file(value: File) {
-      this._file = value
-      this._uploadFile()
-    }
-
-    private _uploadFile(): void {
-      //  This is where we upload a file to Firebase Storage and then record its path in the database.
-      if (this._user && this._auth && this._file && this._storage) {
-        let randomNumber = Math.floor(Math.random() * 100000)
-        let uploadFileRef = ref(
-          this._storage,
-          `${this._user.uid}/${randomNumber} - ${this._file.name}`
-        )
-
-        //  Now, upload the file
-        let uploadTask = uploadBytesResumable(uploadFileRef, this._file)
-        uploadTask.on(
-          "state_changed",
-          (snapshot) => {
-            //  This is where we let Elm know about the upload progress
-            this.dispatchEvent(
-              new CustomEvent("fileUploadProgress", {
-                detail: {
-                  id: this._fileId,
-                  progress: snapshot.bytesTransferred / snapshot.totalBytes,
-                },
-              })
-            )
-          },
-          (error: StorageError) => {
-            //  This is where we let Elm know about any errors that happened while uploading the file
-            this.dispatchEvent(
-              new CustomEvent("fileUploadError", {
-                detail: {
-                  id: this._fileId,
-                  errorCode: error.code,
-                },
-              })
-            )
-          },
-          () => {
-            //  This is where we let Elm know about the upload completion
-            this.dispatchEvent(
-              new CustomEvent("fileUploadComplete", {
-                detail: { id: this._fileId },
-              })
-            )
-          }
-        )
-      }
+      //  Now, upload the file
+      let uploadTask = uploadBytesResumable(uploadFileRef, this.file)
+      uploadTask.on(
+        "state_changed",
+        (snapshot) => {
+          this.dispatchEvent(
+            new CustomEvent("fileUploadProgress", {
+              detail: {
+                id: this.fileId,
+                progress: snapshot.bytesTransferred / snapshot.totalBytes,
+              },
+            })
+          ) //  Let Elm know about the progress
+        },
+        (error: StorageError) => {
+          this.dispatchEvent(
+            new CustomEvent("fileUploadError", { detail: { id: this.fileId } })
+          ) //  Let Elm know about the error
+        },
+        () => {
+          this.dispatchEvent(new CustomEvent("fileUploadComplete")) //  Let Elm know that the upload has completed
+        }
+      )
     }
   }
-)
+}

@@ -9,6 +9,7 @@ customElements.define(
 
     constructor() {
       super()
+      console.log("constructor")
     }
 
     connectedCallback() {

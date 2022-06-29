@@ -12,7 +12,6 @@ import {
 } from "firebase/firestore"
 import { getStorage, ref, uploadBytesResumable } from "firebase/storage"
 import { Report, reportConverter } from "./Report"
-
 import * as pdfjs from "pdfjs-dist"
 
 //  Set up pdfjs
@@ -47,7 +46,7 @@ const main = Elm.Main.init({
 //  Connect up the ports
 main.ports.signInAUser.subscribe(signInAUser)
 main.ports.registerAUser.subscribe(registerAUser)
-main.ports.processAFile.subscribe(processAFile)
+// main.ports.processAFile.subscribe(processAFile)
 main.ports.fetchTheUsersReports.subscribe(fetchTheUsersReports)
 
 //  Port handlers

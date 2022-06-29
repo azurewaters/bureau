@@ -1,7 +1,7 @@
 port module Main exposing (..)
 
 import Browser
-import File
+import File exposing (File)
 import Html exposing (Attribute, Html, button, div, input, text)
 import Html.Attributes exposing (classList, placeholder, property, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
@@ -30,6 +30,32 @@ type alias Flags =
     }
 
 
+type alias Model =
+    { -- Objects from JS
+      flags : Flags
+
+    -- Login and Sign up stuff
+    , screenToShow : Screen
+    , email : String
+    , password : String
+    , loginErrors : Errors
+    , fullName : String
+    , signUpErrors : Errors
+    , currentUsersId : String
+
+    -- Files being uploaded and processed
+    , lastUsedIndexNumber : Int
+    , filesBeingUploaded : FilesBeingUploaded
+
+    --  Reports display stuff
+    , reports : Reports
+    , searchTerm : String
+
+    -- Other
+    , textInFile : String
+    }
+
+
 type Screen
     = Login
     | SignUp
@@ -44,32 +70,24 @@ type alias FileStoragePath =
     String
 
 
-type FileUploadStatus
+type UploadStatus
     = Uploading Float
     | Completed
     | Error String
 
 
-type alias FileBeingProcessed =
+type alias FileBeingUploaded =
     { id : Int
     , name : String
     , size : Int
     , mime : String
     , value : Value
-    , uploadStatus : FileUploadStatus
+    , uploadStatus : UploadStatus
     }
 
 
-type alias FileUploadProgress =
-    { id : Int, progress : Float }
-
-
-type alias FileUploadError =
-    { id : Int }
-
-
-type alias FileUploadCompletion =
-    { id : Int }
+type alias FilesBeingUploaded =
+    List FileBeingUploaded
 
 
 type alias Report =
@@ -85,30 +103,6 @@ type alias Reports =
     List Report
 
 
-type alias Model =
-    { -- Objects from JS
-      flags : Flags
-
-    -- Login and Sign up stuff
-    , screenToShow : Screen
-    , email : String
-    , password : String
-    , loginErrors : Errors
-    , fullName : String
-    , signUpErrors : Errors
-    , currentUsersId : String
-
-    --  Reports display stuff
-    , reports : Reports
-    , lastUsedFileId : Int
-    , filesBeingProcessed : List FileBeingProcessed
-    , searchTerm : String
-
-    -- Other
-    , textInFile : String
-    }
-
-
 init : Flags -> ( Model, Cmd msg )
 init flags =
     ( { flags = flags
@@ -120,8 +114,8 @@ init flags =
       , signUpErrors = []
       , currentUsersId = ""
       , reports = []
-      , lastUsedFileId = 0
-      , filesBeingProcessed = []
+      , lastUsedIndexNumber = 0
+      , filesBeingUploaded = []
       , searchTerm = ""
       , textInFile = ""
       }
@@ -142,9 +136,9 @@ type Msg
       --  Reports messages
     | ReportsFetched Reports
     | FilesDropped (List Value)
-    | FileUploadProgressed FileUploadProgress
-    | FileUploadErrored FileUploadError
-    | FileUploadCompleted FileUploadCompletion
+    | FileUploadProgressed Int Float
+    | FileUploadErrored Int
+    | FileUploadCompleted Int
       --  Miscellaneous
     | GotTextInFile String
     | NoOp
@@ -206,111 +200,94 @@ update msg model =
 
         FilesDropped values ->
             let
-                uniqueImageValues : List Value
-                uniqueImageValues =
-                    values
-                        |> List.filter checkIfFileIsAnImage
-                        |> List.filter (checkIfFileIsAlreadyBeingProcessed model.filesBeingProcessed)
-
-                fileIds : List Int
-                fileIds =
-                    List.range (model.lastUsedFileId + 1) (List.length uniqueImageValues + model.lastUsedFileId)
-
-                filesToProcess : List FileBeingProcessed
-                filesToProcess =
-                    List.indexedMap
-                        (\index value ->
+                imageFileValues : List ( File, Value )
+                imageFileValues =
+                    List.filterMap
+                        (\value ->
                             case Decode.decodeValue File.decoder value of
                                 Ok file ->
-                                    { id = model.lastUsedFileId + index
-                                    , name = File.name file
-                                    , size = File.size file
-                                    , mime = File.mime file
-                                    , value = value
-                                    , uploadStatus = Uploading 0.0
-                                    }
+                                    if List.member (File.mime file) [ "image/jpeg", "image/png", "application/pdf" ] == True then
+                                        Just ( file, value )
+
+                                    else
+                                        Nothing
 
                                 Err _ ->
-                                    { id = -1
-                                    , name = ""
-                                    , size = 0
-                                    , mime = ""
-                                    , value = value
-                                    , uploadStatus = Error "Could not decode file"
-                                    }
+                                    Nothing
                         )
-                        uniqueImageValues
-                        |> List.filter (\f -> f.id > -1)
+                        values
 
-                commandsToProcessFiles : List (Cmd msg)
-                commandsToProcessFiles =
-                    List.map
-                        (\fileToProcess ->
-                            Encode.object
-                                [ ( "id", Encode.int fileToProcess.id )
-                                , ( "file", fileToProcess.value )
-                                ]
-                                |> processAFile
+                namesOfFilesAlreadyBeingUploaded : List String
+                namesOfFilesAlreadyBeingUploaded =
+                    List.map .name model.filesBeingUploaded
+
+                uniqueImageFileValues : List ( File, Value )
+                uniqueImageFileValues =
+                    List.filter
+                        (\( file, _ ) ->
+                            List.member (File.name file) namesOfFilesAlreadyBeingUploaded
+                                |> not
                         )
-                        filesToProcess
+                        imageFileValues
+
+                idsToUse : List Int
+                idsToUse =
+                    List.range model.lastUsedIndexNumber (model.lastUsedIndexNumber + List.length uniqueImageFileValues)
+
+                newFilesBeingUploaded : FilesBeingUploaded
+                newFilesBeingUploaded =
+                    List.map2
+                        (\id ( file, value ) ->
+                            { id = id
+                            , name = File.name file
+                            , size = File.size file
+                            , mime = File.mime file
+                            , value = value
+                            , uploadStatus = Uploading 0
+                            }
+                        )
+                        idsToUse
+                        uniqueImageFileValues
             in
             ( { model
-                | filesBeingProcessed = List.append model.filesBeingProcessed filesToProcess
-                , lastUsedFileId = List.maximum fileIds |> Maybe.withDefault 0
+                | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
+                , lastUsedIndexNumber = model.lastUsedIndexNumber + List.length uniqueImageFileValues
               }
-            , Cmd.batch commandsToProcessFiles
+            , Cmd.none
             )
 
-        FileUploadProgressed fileUploadProgress ->
-            let
-                updateIfCorrectFile : FileUploadProgress -> FileBeingProcessed -> FileBeingProcessed
-                updateIfCorrectFile progress file =
-                    if file.id == progress.id then
-                        { file | uploadStatus = Uploading progress.progress }
+        FileUploadProgressed id progress ->
+            ( { model
+                | filesBeingUploaded =
+                    updateFilesBeingUploaded
+                        model.filesBeingUploaded
+                        id
+                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploading progress })
+              }
+            , Cmd.none
+            )
 
-                    else
-                        file
+        FileUploadErrored id ->
+            ( { model
+                | filesBeingUploaded =
+                    updateFilesBeingUploaded
+                        model.filesBeingUploaded
+                        id
+                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Error "Error" })
+              }
+            , Cmd.none
+            )
 
-                updatedFilesToProcess : List FileBeingProcessed
-                updatedFilesToProcess =
-                    model.filesBeingProcessed
-                        |> List.map (updateIfCorrectFile fileUploadProgress)
-            in
-            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
-
-        FileUploadErrored fileUploadError ->
-            let
-                updateIfCorrectFile : FileUploadError -> FileBeingProcessed -> FileBeingProcessed
-                updateIfCorrectFile error file =
-                    if file.id == error.id then
-                        { file | uploadStatus = Error "" }
-
-                    else
-                        file
-
-                updatedFilesToProcess : List FileBeingProcessed
-                updatedFilesToProcess =
-                    model.filesBeingProcessed
-                        |> List.map (updateIfCorrectFile fileUploadError)
-            in
-            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
-
-        FileUploadCompleted fileUploadCompletion ->
-            let
-                updateIfCorrectFile : FileUploadCompletion -> FileBeingProcessed -> FileBeingProcessed
-                updateIfCorrectFile completion file =
-                    if file.id == completion.id then
-                        { file | uploadStatus = Completed }
-
-                    else
-                        file
-
-                updatedFilesToProcess : List FileBeingProcessed
-                updatedFilesToProcess =
-                    model.filesBeingProcessed
-                        |> List.map (updateIfCorrectFile fileUploadCompletion)
-            in
-            ( { model | filesBeingProcessed = updatedFilesToProcess }, Cmd.none )
+        FileUploadCompleted id ->
+            ( { model
+                | filesBeingUploaded =
+                    updateFilesBeingUploaded
+                        model.filesBeingUploaded
+                        id
+                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Completed })
+              }
+            , Cmd.none
+            )
 
         GotTextInFile t ->
             ( { model | textInFile = t }, Cmd.none )
@@ -319,24 +296,17 @@ update msg model =
             ( model, Cmd.none )
 
 
-checkIfFileIsAnImage : Value -> Bool
-checkIfFileIsAnImage value =
-    case Decode.decodeValue File.decoder value of
-        Ok file ->
-            List.member (File.mime file) [ "image/png", "image/jpeg", "application/pdf" ]
+updateFilesBeingUploaded : FilesBeingUploaded -> Int -> (FileBeingUploaded -> FileBeingUploaded) -> FilesBeingUploaded
+updateFilesBeingUploaded filesBeingUploaded id updateFunction =
+    List.map
+        (\fileBeingUploaded ->
+            if fileBeingUploaded.id == id then
+                updateFunction fileBeingUploaded
 
-        _ ->
-            False
-
-
-checkIfFileIsAlreadyBeingProcessed : List FileBeingProcessed -> Value -> Bool
-checkIfFileIsAlreadyBeingProcessed filesAlreadyBeingProcessed value =
-    case Decode.decodeValue File.decoder value of
-        Ok file ->
-            List.all (\fbp -> fbp.name /= File.name file) filesAlreadyBeingProcessed
-
-        _ ->
-            False
+            else
+                fileBeingUploaded
+        )
+        filesBeingUploaded
 
 
 loginValidator : Validator String Model
@@ -395,55 +365,6 @@ port uploadComplete : (Value -> msg) -> Sub msg
 port fetchTheUsersReports : String -> Cmd msg
 
 
-fileUploadProgressDecoder : Decoder FileUploadProgress
-fileUploadProgressDecoder =
-    Decode.map2 FileUploadProgress
-        (Decode.field "id" Decode.int)
-        (Decode.field "progress" Decode.float)
-
-
-decodeFileUploadProgress : Value -> Msg
-decodeFileUploadProgress value =
-    case Decode.decodeValue fileUploadProgressDecoder value of
-        Ok fileUploadProgress ->
-            FileUploadProgressed fileUploadProgress
-
-        Err _ ->
-            NoOp
-
-
-fileUploadErroredDecoder : Decoder FileUploadError
-fileUploadErroredDecoder =
-    Decode.map FileUploadError
-        (Decode.field "id" Decode.int)
-
-
-decodeFileUploadError : Value -> Msg
-decodeFileUploadError value =
-    case Decode.decodeValue fileUploadErroredDecoder value of
-        Ok fileUploadError ->
-            FileUploadErrored fileUploadError
-
-        Err _ ->
-            NoOp
-
-
-fileUploadCompletionDecoder : Decoder FileUploadCompletion
-fileUploadCompletionDecoder =
-    Decode.map FileUploadCompletion
-        (Decode.field "id" Decode.int)
-
-
-decodeFileUploadCompletion : Value -> Msg
-decodeFileUploadCompletion value =
-    case Decode.decodeValue fileUploadCompletionDecoder value of
-        Ok fileUploadCompletion ->
-            FileUploadCompleted fileUploadCompletion
-
-        Err _ ->
-            NoOp
-
-
 reportDecoder : Decoder Report
 reportDecoder =
     Decode.map5 Report
@@ -481,9 +402,6 @@ subscriptions model =
         Display ->
             Sub.batch
                 [ fetchedUsersReports decodeReports
-                , uploadProgress decodeFileUploadProgress
-                , uploadError decodeFileUploadError
-                , uploadComplete decodeFileUploadCompletion
                 ]
 
 
@@ -578,27 +496,27 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDropZone model.flags.pdfjs model.filesBeingProcessed
+        [ filesDropZone model.flags model.filesBeingUploaded
         , text model.textInFile
         , reportsDisplay model.reports
         ]
 
 
-filesDropZone : Value -> List FileBeingProcessed -> Html Msg
-filesDropZone pdfjs filesToProcess =
+filesDropZone : Flags -> FilesBeingUploaded -> Html Msg
+filesDropZone flags filesBeingUploaded =
     div
         [ onFilesDrop FilesDropped
         , onDragOver NoOp
         ]
         (List.concat
             [ [ div [] [ text "Drag a report here to upload" ] ]
-            , List.map fileDisplay filesToProcess
-            , [ keyedTextGetters pdfjs filesToProcess ]
+            , List.map fileDisplay filesBeingUploaded
+            , [ keyedFileUploaders flags filesBeingUploaded ]
             ]
         )
 
 
-fileDisplay : FileBeingProcessed -> Html Msg
+fileDisplay : FileBeingUploaded -> Html Msg
 fileDisplay fileToProcess =
     div
         []
@@ -608,7 +526,7 @@ fileDisplay fileToProcess =
         ]
 
 
-getUploadStatus : FileBeingProcessed -> String
+getUploadStatus : FileBeingUploaded -> String
 getUploadStatus fileToProcess =
     case fileToProcess.uploadStatus of
         Uploading progress ->
@@ -621,7 +539,41 @@ getUploadStatus fileToProcess =
             "Problem uploading"
 
 
-keyedTextGetters : Value -> List FileBeingProcessed -> Html Msg
+keyedFileUploaders : Flags -> FilesBeingUploaded -> Html Msg
+keyedFileUploaders flags filesBeingUploaded =
+    Html.Keyed.node "div"
+        []
+        (List.map
+            (\fileBeingUploaded -> Tuple.pair (fileBeingUploaded.id |> String.fromInt) (fileUploader flags fileBeingUploaded))
+            filesBeingUploaded
+        )
+
+
+fileUploader : Flags -> FileBeingUploaded -> Html Msg
+fileUploader flags fileBeingUploaded =
+    Html.node "file-uploader"
+        [ property "auth" flags.fbAuth
+        , property "storage" flags.fbStorage
+        , property "fileId" (fileBeingUploaded.id |> Encode.int)
+        , property "file" fileBeingUploaded.value
+        , Html.Events.on "fileUploadProgress"
+            (Decode.map2 FileUploadProgressed
+                (Decode.at [ "details", "id" ] Decode.int)
+                (Decode.at [ "details", "progress" ] Decode.float)
+            )
+        , Html.Events.on "fileUploadError"
+            (Decode.map FileUploadErrored
+                (Decode.at [ "details", "id" ] Decode.int)
+            )
+        , Html.Events.on "fileUploadComplete"
+            (Decode.map FileUploadCompleted
+                (Decode.at [ "details", "id" ] Decode.int)
+            )
+        ]
+        []
+
+
+keyedTextGetters : Value -> List FileBeingUploaded -> Html Msg
 keyedTextGetters pdfjs filesToProcess =
     Html.Keyed.node
         "div"
@@ -632,7 +584,7 @@ keyedTextGetters pdfjs filesToProcess =
         )
 
 
-textGetter : Value -> FileBeingProcessed -> Html Msg
+textGetter : Value -> FileBeingUploaded -> Html Msg
 textGetter pdfjs fileToProcess =
     Html.node "text-getter"
         [ property "pdfjs" pdfjs
