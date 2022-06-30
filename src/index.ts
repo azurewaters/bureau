@@ -45,9 +45,8 @@ const main = Elm.Main.init({
 })
 
 //  Connect up the ports
-main.ports.signInAUser.subscribe(signInAUser)
 main.ports.registerAUser.subscribe(registerAUser)
-// main.ports.processAFile.subscribe(processAFile)
+main.ports.signInAUser.subscribe(signInAUser)
 main.ports.fetchTheUsersReports.subscribe(fetchTheUsersReports)
 
 //  Port handlers
@@ -69,7 +68,7 @@ function registerAUser(details: { email: string; password: string }) {
   throw new Error("Function not implemented.")
 }
 
-function processAFile(fileToProcess: { id: Number; file: File }) {
+function uploadAFile(fileToProcess: { id: Number; file: File }) {
   //  This is where we upload a file to Firebase Storage and then record its path in the database.
   if (fbAuth.currentUser) {
     let userId = fbAuth.currentUser.uid
@@ -81,14 +80,14 @@ function processAFile(fileToProcess: { id: Number; file: File }) {
       "state_changed",
       (snapshot) => {
         //  This is where we let Elm know about the upload progress
-        main.ports.uploadProgress.send({
+        main.ports.uploadProgressed.send({
           id: fileToProcess.id,
           progress: snapshot.bytesTransferred / snapshot.totalBytes,
         })
       },
       (error) => {
         //  This is where we let Elm know about any errors while uploading the file
-        main.ports.uploadError.send({ id: fileToProcess.id }) //  Not yet letting Elm know what error occurred
+        main.ports.uploadErrored.send({ id: fileToProcess.id }) //  Not yet letting Elm know what error occurred
       },
       async () => {
         //  Upload has completed
@@ -102,7 +101,7 @@ function processAFile(fileToProcess: { id: Number; file: File }) {
         })
 
         //  Next, we let Elm know about the upload completion
-        main.ports.uploadComplete.send({
+        main.ports.uploadCompleted.send({
           id: fileToProcess.id,
         })
       }

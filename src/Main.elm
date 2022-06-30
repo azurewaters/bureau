@@ -8,6 +8,8 @@ import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Html.Keyed
 import Json.Decode as Decode exposing (Decoder, Error(..))
 import Json.Encode as Encode exposing (Value)
+import Process
+import Task
 import Time exposing (Posix)
 import Validate exposing (Validator)
 
@@ -50,9 +52,6 @@ type alias Model =
     --  Reports display stuff
     , reports : Reports
     , searchTerm : String
-
-    -- Other
-    , textInFile : String
     }
 
 
@@ -117,7 +116,6 @@ init flags =
       , lastUsedIndexNumber = 0
       , filesBeingUploaded = []
       , searchTerm = ""
-      , textInFile = ""
       }
     , Cmd.none
     )
@@ -139,8 +137,8 @@ type Msg
     | FileUploadProgressed Int Float
     | FileUploadErrored Int
     | FileUploadCompleted Int
+    | RemoveUploadedFile Int
       --  Miscellaneous
-    | GotTextInFile String
     | NoOp
 
 
@@ -286,11 +284,11 @@ update msg model =
                         id
                         (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Completed })
               }
-            , Cmd.none
+            , Task.perform (\_ -> RemoveUploadedFile id) (Process.sleep 3000)
             )
 
-        GotTextInFile t ->
-            ( { model | textInFile = t }, Cmd.none )
+        RemoveUploadedFile id ->
+            ( { model | filesBeingUploaded = List.filter (\fileBeingUploaded -> fileBeingUploaded.id /= id) model.filesBeingUploaded }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -479,7 +477,6 @@ display model =
     div
         []
         [ filesDropZone model.flags model.filesBeingUploaded
-        , text model.textInFile
         , reportsDisplay model.reports
         ]
 
@@ -534,23 +531,17 @@ keyedFileUploaders flags filesBeingUploaded =
 fileUploader : Flags -> FileBeingUploaded -> Html Msg
 fileUploader flags fileBeingUploaded =
     Html.node "file-uploader"
-        [ property "auth" flags.fbAuth
-        , property "storage" flags.fbStorage
-        , property "fileId" (fileBeingUploaded.id |> Encode.int)
+        [ property "fbAuth" flags.fbAuth
+        , property "fbStore" flags.fbStore
+        , property "fbStorage" flags.fbStorage
+        , property "fileId" (Encode.int fileBeingUploaded.id)
         , property "file" fileBeingUploaded.value
-        , Html.Events.on "fileUploadProgress"
-            (Decode.map2 FileUploadProgressed
-                (Decode.at [ "details", "id" ] Decode.int)
-                (Decode.at [ "details", "progress" ] Decode.float)
-            )
-        , Html.Events.on "fileUploadError"
-            (Decode.map FileUploadErrored
-                (Decode.at [ "details", "id" ] Decode.int)
-            )
-        , Html.Events.on "fileUploadComplete"
-            (Decode.map FileUploadCompleted
-                (Decode.at [ "details", "id" ] Decode.int)
-            )
+        , Html.Events.on "fileUploadProgressed" <|
+            Decode.map2 FileUploadProgressed
+                (Decode.succeed fileBeingUploaded.id)
+                (Decode.at [ "detail", "progress" ] Decode.float)
+        , Html.Events.on "fileUploadErrored" (Decode.succeed <| FileUploadErrored fileBeingUploaded.id)
+        , Html.Events.on "fileUploadCompleted" (Decode.succeed <| FileUploadCompleted fileBeingUploaded.id)
         ]
         []
 
@@ -572,10 +563,11 @@ textGetter pdfjs fileToProcess =
         [ property "pdfjs" pdfjs
         , property "fileId" (Encode.int fileToProcess.id)
         , property "file" fileToProcess.value
-        , Html.Events.on "gotText"
-            (Decode.map GotTextInFile <|
-                Decode.at [ "details", "text" ] Decode.string
-            )
+
+        -- , Html.Events.on "gotText"
+        --     (Decode.map GotTextInFile <|
+        --         Decode.at [ "details", "text" ] Decode.string
+        --     )
         ]
         []
 
