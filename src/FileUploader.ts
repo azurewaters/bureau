@@ -5,9 +5,11 @@ import {
   addDoc,
   collection,
   serverTimestamp,
+  getFirestore,
 } from "firebase/firestore"
 import {
   FirebaseStorage,
+  getStorage,
   ref,
   StorageError,
   uploadBytesResumable,
@@ -16,31 +18,35 @@ import {
 @customElement("file-uploader")
 export class FileUploader extends FASTElement {
   @observable fbAuth?: Auth //  Could have used @attr but since it is not a simple primitive that will be reflected in the attribute of the custom element, we are using observable
-  @observable fbStore?: Firestore
-  @observable fbStorage?: FirebaseStorage
   @observable fileId?: number
   @observable file?: File
 
+  //  Private fields
+  #fbStore?: Firestore
+  #fbStorage?: FirebaseStorage
+
   constructor() {
     super()
+    this.#fbStore = getFirestore()
+    this.#fbStorage = getStorage()
   }
 
   connectedCallback() {
     super.connectedCallback()
-    this.uploadTheFile()
+    this.#uploadTheFile()
   }
 
-  uploadTheFile() {
+  #uploadTheFile() {
     //  This is where we upload the file if all the properties we need have been sent in
     if (
       this.fbAuth?.currentUser?.uid &&
-      this.fbStore &&
-      this.fbStorage &&
+      this.#fbStore &&
+      this.#fbStorage &&
       this.file
     ) {
       let randomNumber = Math.floor(Math.random() * 100000)
       let uploadFileRef = ref(
-        this.fbStorage,
+        this.#fbStorage,
         `${this.fbAuth?.currentUser?.uid}/${randomNumber} - ${this.file.name}`
       )
 
@@ -72,11 +78,11 @@ export class FileUploader extends FASTElement {
           if (
             this.fbAuth &&
             this.fbAuth.currentUser &&
-            this.fbStore &&
+            this.#fbStore &&
             this.file
           ) {
             await addDoc(
-              collection(this.fbStore, this.fbAuth.currentUser.uid),
+              collection(this.#fbStore, this.fbAuth.currentUser.uid),
               {
                 name: this.file.name,
                 size: this.file.size,

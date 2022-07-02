@@ -25,8 +25,7 @@ main =
 
 
 type alias Flags =
-    { pdfjs : Value
-    , fbAuth : Value
+    { fbAuth : Value
     , fbStore : Value
     , fbStorage : Value
     }
@@ -45,9 +44,13 @@ type alias Model =
     , signUpErrors : Errors
     , currentUsersId : String
 
-    -- Files being uploaded and processed
-    , lastUsedIndexNumber : Int
+    -- Files being uploaded
+    , lastUsedIndexNumberForFilesBeingUploaded : Int
     , filesBeingUploaded : FilesBeingUploaded
+
+    -- Files being read
+    , lastUsedIndexNumberForFilesBeingRead : Int
+    , filesBeingRead : FilesBeingRead
 
     --  Reports display stuff
     , reports : Reports
@@ -65,16 +68,6 @@ type alias Errors =
     List String
 
 
-type alias FileStoragePath =
-    String
-
-
-type UploadStatus
-    = Uploading Float
-    | Completed
-    | Error String
-
-
 type alias FileBeingUploaded =
     { id : Int
     , name : String
@@ -85,8 +78,35 @@ type alias FileBeingUploaded =
     }
 
 
+type UploadStatus
+    = Uploading Float
+    | Uploaded
+    | ErrorWhileUploading String
+
+
 type alias FilesBeingUploaded =
     List FileBeingUploaded
+
+
+type alias FilesBeingRead =
+    List FileBeingRead
+
+
+type alias FileBeingRead =
+    { id : Int
+    , name : String
+    , size : Int
+    , mime : String
+    , value : Value
+    , readStatus : ReadStatus
+    }
+
+
+type ReadStatus
+    = WaitingToBeRead
+    | Reading Float
+    | Read String
+    | ErrorWhileReading String
 
 
 type alias Report =
@@ -113,8 +133,10 @@ init flags =
       , signUpErrors = []
       , currentUsersId = ""
       , reports = []
-      , lastUsedIndexNumber = 0
+      , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
+      , lastUsedIndexNumberForFilesBeingRead = 0
+      , filesBeingRead = []
       , searchTerm = ""
       }
     , Cmd.none
@@ -131,13 +153,18 @@ type Msg
     | SignUpButtonClicked
     | LoginButtonOnSignUpClicked
     | CredentialsVerified String
-      --  Reports messages
-    | ReportsFetched Reports
+      --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
     | FileUploadErrored Int
     | FileUploadCompleted Int
     | RemoveUploadedFile Int
+      -- File read messages
+    | FileTextRead Int String
+      --  Reports messages
+    | ReportAdded Report
+    | ReportModified Report
+    | ReportRemoved String
       --  Miscellaneous
     | NoOp
 
@@ -186,15 +213,8 @@ update msg model =
                     else
                         Login
               }
-            , fetchTheUsersReports value
+            , Cmd.none
             )
-
-        ReportsFetched reports ->
-            let
-                _ =
-                    Debug.log "ReportsFetched"
-            in
-            ( { model | reports = reports }, Cmd.none )
 
         FilesDropped values ->
             let
@@ -230,7 +250,7 @@ update msg model =
 
                 idsToUse : List Int
                 idsToUse =
-                    List.range model.lastUsedIndexNumber (model.lastUsedIndexNumber + List.length uniqueImageFileValues)
+                    List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFileValues)
 
                 newFilesBeingUploaded : FilesBeingUploaded
                 newFilesBeingUploaded =
@@ -249,7 +269,7 @@ update msg model =
             in
             ( { model
                 | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
-                , lastUsedIndexNumber = model.lastUsedIndexNumber + List.length uniqueImageFileValues
+                , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFileValues
               }
             , Cmd.none
             )
@@ -271,7 +291,7 @@ update msg model =
                     updateFilesBeingUploaded
                         model.filesBeingUploaded
                         id
-                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Error "Error" })
+                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = ErrorWhileUploading "Error" })
               }
             , Cmd.none
             )
@@ -282,13 +302,55 @@ update msg model =
                     updateFilesBeingUploaded
                         model.filesBeingUploaded
                         id
-                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Completed })
+                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploaded })
               }
             , Task.perform (\_ -> RemoveUploadedFile id) (Process.sleep 3000)
             )
 
         RemoveUploadedFile id ->
             ( { model | filesBeingUploaded = List.filter (\fileBeingUploaded -> fileBeingUploaded.id /= id) model.filesBeingUploaded }, Cmd.none )
+
+        FileTextRead id textInFile ->
+            ( { model
+                | filesBeingRead =
+                    List.map
+                        (\fileBeingRead ->
+                            if id == fileBeingRead.id then
+                                { fileBeingRead | readStatus = Read textInFile }
+
+                            else
+                                fileBeingRead
+                        )
+                        model.filesBeingRead
+              }
+            , Cmd.none
+            )
+
+        ReportAdded newReport ->
+            let
+                _ =
+                    Debug.log (Debug.toString newReport)
+            in
+            ( { model | reports = List.append model.reports [ newReport ] }, Cmd.none )
+
+        ReportModified modifiedReport ->
+            ( { model
+                | reports =
+                    List.map
+                        (\report ->
+                            if report.id == modifiedReport.id then
+                                modifiedReport
+
+                            else
+                                report
+                        )
+                        model.reports
+              }
+            , Cmd.none
+            )
+
+        ReportRemoved id ->
+            ( { model | reports = List.filter (\report -> report.id /= id) model.reports }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -338,29 +400,11 @@ port signInAUser :
 port registerAUser : { email : String, name : String } -> Cmd msg
 
 
-port processAFile : Value -> Cmd msg
-
-
-port fetchedUsersReports : (Value -> msg) -> Sub msg
-
-
 
 -- Port Ins
 
 
 port credentialsVerified : (String -> msg) -> Sub msg
-
-
-port uploadProgress : (Value -> msg) -> Sub msg
-
-
-port uploadError : (Value -> msg) -> Sub msg
-
-
-port uploadComplete : (Value -> msg) -> Sub msg
-
-
-port fetchTheUsersReports : String -> Cmd msg
 
 
 reportDecoder : Decoder Report
@@ -373,34 +417,14 @@ reportDecoder =
         (Decode.field "uploadedOn" Decode.int |> Decode.map Time.millisToPosix)
 
 
-reportsDecoder : Decoder Reports
-reportsDecoder =
-    Decode.list reportDecoder
-
-
-decodeReports : Value -> Msg
-decodeReports value =
-    case Decode.decodeValue reportsDecoder value of
-        Ok reports ->
-            ReportsFetched reports
-
-        Err _ ->
-            NoOp
-
-
 subscriptions : Model -> Sub Msg
 subscriptions model =
     case model.screenToShow of
         Login ->
             Sub.batch [ credentialsVerified CredentialsVerified ]
 
-        SignUp ->
+        _ ->
             Sub.none
-
-        Display ->
-            Sub.batch
-                [ fetchedUsersReports decodeReports
-                ]
 
 
 
@@ -476,13 +500,21 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDropZone model.flags model.filesBeingUploaded
+        [ filesDropZone model.flags model.filesBeingUploaded model.filesBeingRead
         , reportsDisplay model.reports
+        , Html.node "database-connector"
+            [ property "fbAuth" model.flags.fbAuth
+            , property "fbStore" model.flags.fbStore
+            , Html.Events.on "reportAdded" (Decode.map ReportAdded (Decode.at [ "detail", "report" ] reportDecoder))
+            , Html.Events.on "reportModified" (Decode.map ReportModified (Decode.at [ "detail", "report" ] reportDecoder))
+            , Html.Events.on "reportRemoved" (Decode.map ReportRemoved (Decode.at [ "detail", "id" ] Decode.string))
+            ]
+            []
         ]
 
 
-filesDropZone : Flags -> FilesBeingUploaded -> Html Msg
-filesDropZone flags filesBeingUploaded =
+filesDropZone : Flags -> FilesBeingUploaded -> FilesBeingRead -> Html Msg
+filesDropZone flags filesBeingUploaded filesBeingRead =
     div
         [ onFilesDrop FilesDropped
         , onDragOver NoOp
@@ -491,6 +523,7 @@ filesDropZone flags filesBeingUploaded =
             [ [ div [] [ text "Drag a report here to upload" ] ]
             , List.map fileDisplay filesBeingUploaded
             , [ keyedFileUploaders flags filesBeingUploaded ]
+            , [ keyedTextGetters filesBeingRead ]
             ]
         )
 
@@ -511,10 +544,10 @@ getUploadStatus fileToProcess =
         Uploading progress ->
             (round progress |> String.fromInt) ++ "% uploaded"
 
-        Completed ->
+        Uploaded ->
             "Uploaded"
 
-        Error _ ->
+        ErrorWhileUploading _ ->
             "Problem uploading"
 
 
@@ -546,28 +579,27 @@ fileUploader flags fileBeingUploaded =
         []
 
 
-keyedTextGetters : Value -> List FileBeingUploaded -> Html Msg
-keyedTextGetters pdfjs filesToProcess =
+keyedTextGetters : FilesBeingRead -> Html Msg
+keyedTextGetters filesBeingRead =
     Html.Keyed.node
         "div"
         []
         (List.map
-            (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter pdfjs fileToProcess))
-            filesToProcess
+            (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter fileToProcess))
+            filesBeingRead
         )
 
 
-textGetter : Value -> FileBeingUploaded -> Html Msg
-textGetter pdfjs fileToProcess =
+textGetter : FileBeingRead -> Html Msg
+textGetter fileBeingRead =
     Html.node "text-getter"
-        [ property "pdfjs" pdfjs
-        , property "fileId" (Encode.int fileToProcess.id)
-        , property "file" fileToProcess.value
-
-        -- , Html.Events.on "gotText"
-        --     (Decode.map GotTextInFile <|
-        --         Decode.at [ "details", "text" ] Decode.string
-        --     )
+        [ property "fileId" (Encode.int fileBeingRead.id)
+        , property "file" fileBeingRead.value
+        , Html.Events.on "readText"
+            (Decode.map2 FileTextRead
+                (Decode.succeed fileBeingRead.id)
+                (Decode.at [ "details", "text" ] Decode.string)
+            )
         ]
         []
 

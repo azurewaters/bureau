@@ -1,7 +1,7 @@
 //  This is where we tell Elm to take over the <main> element.
 import { Elm } from "./Main.elm"
 import { initializeApp } from "firebase/app"
-import { getAuth, signInWithEmailAndPassword } from "firebase/auth"
+import { getAuth, signInWithEmailAndPassword, Unsubscribe } from "firebase/auth"
 import {
   getFirestore,
   addDoc,
@@ -9,15 +9,11 @@ import {
   getDocs,
   QueryDocumentSnapshot,
   serverTimestamp,
+  query,
+  onSnapshot,
 } from "firebase/firestore"
 import { getStorage, ref, uploadBytesResumable } from "firebase/storage"
 import { Report, reportConverter } from "./Report"
-
-import * as pdfjs from "pdfjs-dist"
-
-//  Set up pdfjs
-pdfjs.GlobalWorkerOptions.workerSrc =
-  "https://cdn.jsdelivr.net/npm/pdfjs-dist@2.14.305/build/pdf.worker.min.js"
 
 // Initialize Firebase
 const firebaseConfig = {
@@ -30,24 +26,18 @@ const firebaseConfig = {
 }
 const fb = initializeApp(firebaseConfig)
 const fbAuth = getAuth()
-const fbStore = getFirestore()
-const fbStorage = getStorage()
 
 //  Initialise everything
 const main = Elm.Main.init({
   node: document.getElementsByTagName("main")[0],
   flags: {
-    pdfjs: pdfjs,
     fbAuth: fbAuth,
-    fbStore: fbStore,
-    fbStorage: fbStorage,
   },
 })
 
 //  Connect up the ports
 main.ports.registerAUser.subscribe(registerAUser)
 main.ports.signInAUser.subscribe(signInAUser)
-main.ports.fetchTheUsersReports.subscribe(fetchTheUsersReports)
 
 //  Port handlers
 function signInAUser(credentials: { email: string; password: string }) {
@@ -66,66 +56,4 @@ function signInAUser(credentials: { email: string; password: string }) {
 function registerAUser(details: { email: string; password: string }) {
   console.log(details)
   throw new Error("Function not implemented.")
-}
-
-function uploadAFile(fileToProcess: { id: Number; file: File }) {
-  //  This is where we upload a file to Firebase Storage and then record its path in the database.
-  if (fbAuth.currentUser) {
-    let userId = fbAuth.currentUser.uid
-    let randomNumber = Math.floor(Math.random() * 100000)
-    let filenameToUploadAs = `${randomNumber} - ${fileToProcess.file.name}`
-    let reportRef = ref(fbStorage, `${userId}/${filenameToUploadAs}`)
-    let uploadTask = uploadBytesResumable(reportRef, fileToProcess.file)
-    uploadTask.on(
-      "state_changed",
-      (snapshot) => {
-        //  This is where we let Elm know about the upload progress
-        main.ports.uploadProgressed.send({
-          id: fileToProcess.id,
-          progress: snapshot.bytesTransferred / snapshot.totalBytes,
-        })
-      },
-      (error) => {
-        //  This is where we let Elm know about any errors while uploading the file
-        main.ports.uploadErrored.send({ id: fileToProcess.id }) //  Not yet letting Elm know what error occurred
-      },
-      async () => {
-        //  Upload has completed
-
-        //  Now, record the details of the file in the database
-        await addDoc(collection(fbStore, userId), {
-          name: fileToProcess.file.name,
-          size: fileToProcess.file.size,
-          mime: fileToProcess.file.type,
-          uploadedOn: serverTimestamp(),
-        })
-
-        //  Next, we let Elm know about the upload completion
-        main.ports.uploadCompleted.send({
-          id: fileToProcess.id,
-        })
-      }
-    )
-  } else {
-    //  We shouldn't ever get here
-    throw new Error("No user logged in.")
-  }
-}
-
-async function fetchTheUsersReports(userId: string) {
-  //  If the userId is valid
-  //  Fetch all the files belonging to the user from firestore
-  if (userId) {
-    let reports: any[] = []
-    const querySnapshot = await getDocs(
-      collection(fbStore, `${userId}`).withConverter(reportConverter)
-    )
-    querySnapshot.forEach((storedFile: QueryDocumentSnapshot<Report>) => {
-      let sF: any = storedFile.data()
-      sF.uploadedOn =
-        sF.uploadedOn.seconds * 1000 + sF.uploadedOn.nanoseconds / 1000000 //  Because Elm can use this
-      reports.push(sF)
-    })
-    main.ports.fetchedUsersReports.send(reports)
-  }
 }
