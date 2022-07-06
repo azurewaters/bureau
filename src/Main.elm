@@ -6,7 +6,8 @@ import Html exposing (Attribute, Html, button, div, input, text)
 import Html.Attributes exposing (class, placeholder, property, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Html.Keyed
-import Json.Decode as Decode exposing (Decoder, Error(..))
+import Http
+import Json.Decode as Decode exposing (Decoder, Error(..), decodeValue, field, string)
 import Json.Encode as Encode exposing (Value)
 import Process
 import Task
@@ -24,25 +25,20 @@ main =
         }
 
 
-type alias Flags =
-    { fbAuth : Value
-    , fbStore : Value
-    , fbStorage : Value
-    }
-
-
 type alias Model =
     { -- Objects from JS
       flags : Flags
 
-    -- Login and Sign up stuff
+    --  General stuff
     , screenToShow : Screen
+    , token : Maybe String
+
+    -- Login and Sign up stuff
     , email : String
     , password : String
     , loginErrors : Errors
-    , fullName : String
     , signUpErrors : Errors
-    , currentUsersId : String
+    , currentUsersId : Maybe String
 
     -- Files being uploaded
     , lastUsedIndexNumberForFilesBeingUploaded : Int
@@ -58,10 +54,21 @@ type alias Model =
     }
 
 
+type alias Flags =
+    { fbAuth : Value
+    }
+
+
 type Screen
     = Login
     | SignUp
     | Display
+
+
+type alias SessionDetails =
+    { token : String
+    , userId : String
+    }
 
 
 type alias Errors =
@@ -126,12 +133,12 @@ init : Flags -> ( Model, Cmd msg )
 init flags =
     ( { flags = flags
       , screenToShow = Login
-      , email = "t@t.com"
-      , password = "tester"
+      , token = Nothing
+      , email = "azurewaters@gmail.com"
+      , password = "T3$t(er)"
       , loginErrors = []
-      , fullName = ""
       , signUpErrors = []
-      , currentUsersId = ""
+      , currentUsersId = Nothing
       , reports = []
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
@@ -147,12 +154,11 @@ type Msg
     = --  Login and registration messages
       EmailTyped String
     | PasswordTyped String
-    | LoginButtonClicked
-    | SignUpButtonOnLoginClicked
-    | FullNameTyped String
-    | SignUpButtonClicked
-    | LoginButtonOnSignUpClicked
-    | CredentialsVerified String
+    | LoginClicked
+    | SignUpOnLoginClicked
+    | SignUpClicked
+    | LoginOnSignUpClicked
+    | UserSignedIn SessionDetails
       --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
@@ -162,6 +168,7 @@ type Msg
       -- File read messages
     | FileTextRead Int String
       --  Reports messages
+    | GotReports (Result Http.Error String)
     | ReportAdded Report
     | ReportModified Report
     | ReportRemoved String
@@ -178,7 +185,7 @@ update msg model =
         PasswordTyped password ->
             ( { model | password = password }, Cmd.none )
 
-        LoginButtonClicked ->
+        LoginClicked ->
             case Validate.validate loginValidator model of
                 Ok _ ->
                     ( { model | loginErrors = [] }, signInAUser { email = model.email, password = model.password } )
@@ -186,32 +193,56 @@ update msg model =
                 Err errors ->
                     ( { model | loginErrors = errors }, Cmd.none )
 
-        SignUpButtonOnLoginClicked ->
+        SignUpOnLoginClicked ->
             ( { model | screenToShow = SignUp }, Cmd.none )
 
-        FullNameTyped fullName ->
-            ( { model | fullName = fullName }, Cmd.none )
-
-        SignUpButtonClicked ->
+        SignUpClicked ->
             case Validate.validate signUpValidator model of
                 Ok _ ->
-                    ( { model | signUpErrors = [] }, registerAUser { email = model.email, name = model.fullName } )
+                    ( { model | signUpErrors = [] }, signUpAUser { email = model.email, password = model.password } )
 
                 Err errors ->
                     ( { model | signUpErrors = errors }, Cmd.none )
 
-        LoginButtonOnSignUpClicked ->
+        LoginOnSignUpClicked ->
             ( { model | screenToShow = Login }, Cmd.none )
 
-        CredentialsVerified value ->
+        UserSignedIn sessionDetails ->
             ( { model
-                | currentUsersId = value
+                | token = Just (Debug.log sessionDetails.token sessionDetails.token)
+                , currentUsersId = Just sessionDetails.userId
                 , screenToShow =
-                    if value /= "" then
+                    if sessionDetails.userId /= "" then
                         Display
 
                     else
                         Login
+              }
+            , Http.request
+                { method = "GET"
+                , headers =
+                    [ Http.header "Access-Control-Allow-Origin" "*"
+                    , Http.header "Origin" "http://localhost:3000"
+                    , Http.header "Apikey" sessionDetails.token
+                    , Http.header "Authorization" ("Bearer " ++ sessionDetails.token)
+                    ]
+                , url = "https://bgwgivatowayfodanvqf.supabase.co/rest/v1/UploadedFile?select=*"
+                , body = Http.emptyBody
+                , expect = Http.expectJson GotReports (Decode.succeed "Got reports")
+                , timeout = Nothing
+                , tracker = Nothing
+                }
+            )
+
+        GotReports result ->
+            ( { model
+                | reports =
+                    case result of
+                        Ok reports ->
+                            model.reports
+
+                        Err error ->
+                            Debug.log ("An error occurred: " ++ Debug.toString error) model.reports
               }
             , Cmd.none
             )
@@ -222,7 +253,7 @@ update msg model =
                 imageFileValues =
                     List.filterMap
                         (\value ->
-                            case Decode.decodeValue File.decoder value of
+                            case decodeValue File.decoder value of
                                 Ok file ->
                                     if List.member (File.mime file) [ "image/jpeg", "image/png", "application/pdf" ] == True then
                                         Just ( file, value )
@@ -397,68 +428,67 @@ port signInAUser :
     -> Cmd msg --  Since we are not expecting any message in return, the return type is the lowercase 'msg'
 
 
-port registerAUser : { email : String, name : String } -> Cmd msg
+port signUpAUser : { email : String, password : String } -> Cmd msg
 
 
 
 -- Port Ins
 
 
-port credentialsVerified : (String -> msg) -> Sub msg
+port userSignedIn : (Value -> msg) -> Sub msg
 
 
-reportDecoder : Decoder Report
-reportDecoder =
-    Decode.map5 Report
-        (Decode.field "id" Decode.string)
-        (Decode.field "name" Decode.string)
-        (Decode.field "size" Decode.int)
-        (Decode.field "mime" Decode.string)
-        (Decode.field "uploadedOn" Decode.int |> Decode.map Time.millisToPosix)
+port tokenRefreshed : (String -> msg) -> Sub msg
 
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
     case model.screenToShow of
         Login ->
-            Sub.batch [ credentialsVerified CredentialsVerified ]
+            Sub.batch
+                [ userSignedIn decodeUserSignedIn
+                ]
 
         _ ->
             Sub.none
 
 
+decodeUserSignedIn : Value -> Msg
+decodeUserSignedIn value =
+    case decodeValue sessionDetailsDecoder value of
+        Ok s ->
+            UserSignedIn s
+
+        Err _ ->
+            let
+                _ =
+                    Debug.log "Error decoding UserSignedIn"
+            in
+            NoOp
+
+
+sessionDetailsDecoder : Decoder SessionDetails
+sessionDetailsDecoder =
+    Decode.map2 (\t u -> { token = t, userId = u }) (field "token" string) (field "userId" string)
+
+
+reportsDecoder : Decoder Reports
+reportsDecoder =
+    Decode.list reportDecoder
+
+
+reportDecoder : Decoder Report
+reportDecoder =
+    Decode.map5 Report
+        (field "id" string)
+        (field "name" string)
+        (field "size" Decode.int)
+        (field "mime" string)
+        (field "uploadedOn" Decode.int |> Decode.map Time.millisToPosix)
+
+
 
 --  VIEWS
-
-
-onDragStart : Msg -> Attribute Msg
-onDragStart msg =
-    on "dragstart" (Decode.succeed msg)
-
-
-onDragOver : Msg -> Attribute Msg
-onDragOver msg =
-    preventDefaultOn "dragover" (Decode.succeed ( msg, True ))
-
-
-onDrop : Msg -> Attribute Msg
-onDrop msg =
-    preventDefaultOn "drop" (Decode.succeed ( msg, True ))
-
-
-onFilesDrop : (List Value -> Msg) -> Attribute Msg
-onFilesDrop msg =
-    preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
-
-
-filesDecoder : Decoder (List Value)
-filesDecoder =
-    Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
-
-
-onDragEnd : Msg -> Attribute Msg
-onDragEnd msg =
-    on "dragend" (Decode.succeed msg)
 
 
 view : Model -> Html Msg
@@ -479,8 +509,8 @@ login model =
     div []
         [ input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
         , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
-        , button [ onClick SignUpButtonOnLoginClicked, class "btn" ] [ text "Sign Up" ]
-        , button [ onClick LoginButtonClicked, class "btn btn-primary" ] [ text "Login" ]
+        , button [ onClick SignUpOnLoginClicked, class "btn" ] [ text "Sign Up" ]
+        , button [ onClick LoginClicked, class "btn btn-primary" ] [ text "Login" ]
         , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
         ]
 
@@ -489,9 +519,9 @@ signUp : Model -> Html Msg
 signUp model =
     div []
         [ input [ type_ "email", required True, placeholder "Your email address", class "input", onInput EmailTyped, value model.email ] []
-        , input [ type_ "string", required True, placeholder "Your full name", class "input", onInput FullNameTyped, value model.fullName ] []
-        , button [ onClick LoginButtonOnSignUpClicked, class "btn btn-primary" ] [ text "Login" ]
-        , button [ onClick SignUpButtonClicked, class "btn" ] [ text "Sign up" ]
+        , input [ type_ "password", required True, placeholder "Set a password", class "input", onInput PasswordTyped, value model.password ] []
+        , button [ onClick LoginOnSignUpClicked, class "btn" ] [ text "Login" ]
+        , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
         , div [] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
         ]
 
@@ -504,10 +534,9 @@ display model =
         , reportsDisplay model.reports
         , Html.node "database-connector"
             [ property "fbAuth" model.flags.fbAuth
-            , property "fbStore" model.flags.fbStore
             , Html.Events.on "reportAdded" (Decode.map ReportAdded (Decode.at [ "detail", "report" ] reportDecoder))
             , Html.Events.on "reportModified" (Decode.map ReportModified (Decode.at [ "detail", "report" ] reportDecoder))
-            , Html.Events.on "reportRemoved" (Decode.map ReportRemoved (Decode.at [ "detail", "id" ] Decode.string))
+            , Html.Events.on "reportRemoved" (Decode.map ReportRemoved (Decode.at [ "detail", "id" ] string))
             ]
             []
         ]
@@ -565,8 +594,6 @@ fileUploader : Flags -> FileBeingUploaded -> Html Msg
 fileUploader flags fileBeingUploaded =
     Html.node "file-uploader"
         [ property "fbAuth" flags.fbAuth
-        , property "fbStore" flags.fbStore
-        , property "fbStorage" flags.fbStorage
         , property "fileId" (Encode.int fileBeingUploaded.id)
         , property "file" fileBeingUploaded.value
         , Html.Events.on "fileUploadProgressed" <|
@@ -598,7 +625,7 @@ textGetter fileBeingRead =
         , Html.Events.on "readText"
             (Decode.map2 FileTextRead
                 (Decode.succeed fileBeingRead.id)
-                (Decode.at [ "details", "text" ] Decode.string)
+                (Decode.at [ "details", "text" ] string)
             )
         ]
         []
@@ -674,3 +701,33 @@ getMonthNameFromMonth month =
 
         Time.Dec ->
             "Dec"
+
+
+onDragStart : Msg -> Attribute Msg
+onDragStart msg =
+    on "dragstart" (Decode.succeed msg)
+
+
+onDragOver : Msg -> Attribute Msg
+onDragOver msg =
+    preventDefaultOn "dragover" (Decode.succeed ( msg, True ))
+
+
+onDrop : Msg -> Attribute Msg
+onDrop msg =
+    preventDefaultOn "drop" (Decode.succeed ( msg, True ))
+
+
+onFilesDrop : (List Value -> Msg) -> Attribute Msg
+onFilesDrop msg =
+    preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
+
+
+filesDecoder : Decoder (List Value)
+filesDecoder =
+    Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
+
+
+onDragEnd : Msg -> Attribute Msg
+onDragEnd msg =
+    on "dragend" (Decode.succeed msg)
