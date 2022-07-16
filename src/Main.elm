@@ -3,19 +3,16 @@ port module Main exposing (..)
 import Browser
 import File exposing (File)
 import Html exposing (Attribute, Html, button, div, input, text)
-import Html.Attributes exposing (class, placeholder, property, required, type_, value)
+import Html.Attributes exposing (class, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
-import Html.Keyed
-import Http
-import Json.Decode as Decode exposing (Decoder, Error(..), decodeValue, field, string)
-import Json.Encode as Encode exposing (Value)
+import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, string)
 import Process
 import Task
 import Time exposing (Posix)
 import Validate exposing (Validator)
 
 
-main : Program Flags Model Msg
+main : Program () Model Msg
 main =
     Browser.element
         { init = init
@@ -26,12 +23,8 @@ main =
 
 
 type alias Model =
-    { -- Objects from JS
-      flags : Flags
-
-    --  General stuff
-    , screenToShow : Screen
-    , token : Maybe String
+    { --  General stuff
+      screenToShow : Screen
 
     -- Login and Sign up stuff
     , email : String
@@ -51,11 +44,6 @@ type alias Model =
     --  Reports display stuff
     , reports : Reports
     , searchTerm : String
-    }
-
-
-type alias Flags =
-    { fbAuth : Value
     }
 
 
@@ -129,11 +117,9 @@ type alias Reports =
     List Report
 
 
-init : Flags -> ( Model, Cmd msg )
-init flags =
-    ( { flags = flags
-      , screenToShow = Login
-      , token = Nothing
+init : () -> ( Model, Cmd msg )
+init _ =
+    ( { screenToShow = Login
       , email = "azurewaters@gmail.com"
       , password = "T3$t(er)"
       , loginErrors = []
@@ -158,17 +144,16 @@ type Msg
     | SignUpOnLoginClicked
     | SignUpClicked
     | LoginOnSignUpClicked
-    | UserSignedIn SessionDetails
+    | UserSignedIn String
       --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
     | FileUploadErrored Int
     | FileUploadCompleted Int
-    | RemoveUploadedFile Int
+    | UnlistUploadedFile Int
       -- File read messages
     | FileTextRead Int String
       --  Reports messages
-    | GotReports (Result Http.Error String)
     | ReportAdded Report
     | ReportModified Report
     | ReportRemoved String
@@ -207,42 +192,15 @@ update msg model =
         LoginOnSignUpClicked ->
             ( { model | screenToShow = Login }, Cmd.none )
 
-        UserSignedIn sessionDetails ->
+        UserSignedIn userId ->
             ( { model
-                | token = Just (Debug.log sessionDetails.token sessionDetails.token)
-                , currentUsersId = Just sessionDetails.userId
+                | currentUsersId = Just userId
                 , screenToShow =
-                    if sessionDetails.userId /= "" then
+                    if userId /= "" then
                         Display
 
                     else
                         Login
-              }
-            , Http.request
-                { method = "GET"
-                , headers =
-                    [ Http.header "Access-Control-Allow-Origin" "*"
-                    , Http.header "Origin" "http://localhost:3000"
-                    , Http.header "Apikey" sessionDetails.token
-                    , Http.header "Authorization" ("Bearer " ++ sessionDetails.token)
-                    ]
-                , url = "https://bgwgivatowayfodanvqf.supabase.co/rest/v1/UploadedFile?select=*"
-                , body = Http.emptyBody
-                , expect = Http.expectJson GotReports (Decode.succeed "Got reports")
-                , timeout = Nothing
-                , tracker = Nothing
-                }
-            )
-
-        GotReports result ->
-            ( { model
-                | reports =
-                    case result of
-                        Ok reports ->
-                            model.reports
-
-                        Err error ->
-                            Debug.log ("An error occurred: " ++ Debug.toString error) model.reports
               }
             , Cmd.none
             )
@@ -297,12 +255,20 @@ update msg model =
                         )
                         idsToUse
                         uniqueImageFileValues
+
+                commandsToUploadTheFiles : List (Cmd Msg)
+                commandsToUploadTheFiles =
+                    List.map
+                        (\fileBeingUploaded ->
+                            uploadAFile { id = fileBeingUploaded.id, file = fileBeingUploaded.value }
+                        )
+                        newFilesBeingUploaded
             in
             ( { model
                 | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
                 , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFileValues
               }
-            , Cmd.none
+            , Cmd.batch commandsToUploadTheFiles
             )
 
         FileUploadProgressed id progress ->
@@ -335,10 +301,10 @@ update msg model =
                         id
                         (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploaded })
               }
-            , Task.perform (\_ -> RemoveUploadedFile id) (Process.sleep 3000)
+            , Task.perform (\_ -> UnlistUploadedFile id) (Process.sleep 3000)
             )
 
-        RemoveUploadedFile id ->
+        UnlistUploadedFile id ->
             ( { model | filesBeingUploaded = List.filter (\fileBeingUploaded -> fileBeingUploaded.id /= id) model.filesBeingUploaded }, Cmd.none )
 
         FileTextRead id textInFile ->
@@ -358,10 +324,6 @@ update msg model =
             )
 
         ReportAdded newReport ->
-            let
-                _ =
-                    Debug.log (Debug.toString newReport)
-            in
             ( { model | reports = List.append model.reports [ newReport ] }, Cmd.none )
 
         ReportModified modifiedReport ->
@@ -431,14 +393,32 @@ port signInAUser :
 port signUpAUser : { email : String, password : String } -> Cmd msg
 
 
+port uploadAFile : { id : Int, file : Value } -> Cmd msg
+
+
 
 -- Port Ins
 
 
-port userSignedIn : (Value -> msg) -> Sub msg
+port userSignedIn : (String -> msg) -> Sub msg
 
 
-port tokenRefreshed : (String -> msg) -> Sub msg
+port fileUploadProgressed : (Value -> msg) -> Sub msg
+
+
+port fileUploadErrored : (Int -> msg) -> Sub msg
+
+
+port fileUploadCompleted : (Int -> msg) -> Sub msg
+
+
+port reportAdded : (Value -> msg) -> Sub msg
+
+
+port reportModified : (Value -> msg) -> Sub msg
+
+
+port reportRemoved : (Value -> msg) -> Sub msg
 
 
 subscriptions : Model -> Sub Msg
@@ -446,30 +426,66 @@ subscriptions model =
     case model.screenToShow of
         Login ->
             Sub.batch
-                [ userSignedIn decodeUserSignedIn
+                [ userSignedIn UserSignedIn
                 ]
 
-        _ ->
+        SignUp ->
             Sub.none
 
+        Display ->
+            Sub.batch
+                [ reportAdded decodeReportAdded
+                , reportModified decodeReportModified
+                , reportRemoved decodeReportRemoved
+                , fileUploadProgressed decodeFileUploadProgress
+                , fileUploadErrored FileUploadErrored
+                , fileUploadCompleted FileUploadCompleted
+                ]
 
-decodeUserSignedIn : Value -> Msg
-decodeUserSignedIn value =
-    case decodeValue sessionDetailsDecoder value of
-        Ok s ->
-            UserSignedIn s
+
+decodeReportAdded : Value -> Msg
+decodeReportAdded value =
+    case decodeValue reportDecoder value of
+        Ok report ->
+            ReportAdded report
+
+        Err error ->
+            Debug.log ("Error while decoding report:" ++ Debug.toString error ++ Debug.toString value) NoOp
+
+
+decodeReportModified : Value -> Msg
+decodeReportModified value =
+    case decodeValue reportDecoder value of
+        Ok report ->
+            ReportModified report
+
+        Err error ->
+            Debug.log ("Error while decoding report:" ++ Debug.toString error ++ Debug.toString value) NoOp
+
+
+decodeReportRemoved : Value -> Msg
+decodeReportRemoved value =
+    case decodeValue string value of
+        Ok id ->
+            ReportRemoved id
+
+        Err error ->
+            Debug.log ("Error while decoding report id:" ++ Debug.toString error ++ Debug.toString value) NoOp
+
+
+decodeFileUploadProgress : Value -> Msg
+decodeFileUploadProgress value =
+    case decodeValue fileUploadProgressDecoder value of
+        Ok ( id, progress ) ->
+            FileUploadProgressed id progress
 
         Err _ ->
-            let
-                _ =
-                    Debug.log "Error decoding UserSignedIn"
-            in
             NoOp
 
 
-sessionDetailsDecoder : Decoder SessionDetails
-sessionDetailsDecoder =
-    Decode.map2 (\t u -> { token = t, userId = u }) (field "token" string) (field "userId" string)
+fileUploadProgressDecoder : Decoder ( Int, Float )
+fileUploadProgressDecoder =
+    Decode.map2 Tuple.pair (field "id" Decode.int) (field "progress" Decode.float)
 
 
 reportsDecoder : Decoder Reports
@@ -530,20 +546,13 @@ display : Model -> Html Msg
 display model =
     div
         []
-        [ filesDropZone model.flags model.filesBeingUploaded model.filesBeingRead
+        [ filesDropZone model.filesBeingUploaded model.filesBeingRead
         , reportsDisplay model.reports
-        , Html.node "database-connector"
-            [ property "fbAuth" model.flags.fbAuth
-            , Html.Events.on "reportAdded" (Decode.map ReportAdded (Decode.at [ "detail", "report" ] reportDecoder))
-            , Html.Events.on "reportModified" (Decode.map ReportModified (Decode.at [ "detail", "report" ] reportDecoder))
-            , Html.Events.on "reportRemoved" (Decode.map ReportRemoved (Decode.at [ "detail", "id" ] string))
-            ]
-            []
         ]
 
 
-filesDropZone : Flags -> FilesBeingUploaded -> FilesBeingRead -> Html Msg
-filesDropZone flags filesBeingUploaded filesBeingRead =
+filesDropZone : FilesBeingUploaded -> FilesBeingRead -> Html Msg
+filesDropZone filesBeingUploaded filesBeingRead =
     div
         [ onFilesDrop FilesDropped
         , onDragOver NoOp
@@ -551,8 +560,9 @@ filesDropZone flags filesBeingUploaded filesBeingRead =
         (List.concat
             [ [ div [] [ text "Drag a report here to upload" ] ]
             , List.map fileDisplay filesBeingUploaded
-            , [ keyedFileUploaders flags filesBeingUploaded ]
-            , [ keyedTextGetters filesBeingRead ]
+
+            -- , [ keyedFileUploaders flags filesBeingUploaded ]
+            -- , [ keyedTextGetters filesBeingRead ]
             ]
         )
 
@@ -580,55 +590,50 @@ getUploadStatus fileToProcess =
             "Problem uploading"
 
 
-keyedFileUploaders : Flags -> FilesBeingUploaded -> Html Msg
-keyedFileUploaders flags filesBeingUploaded =
-    Html.Keyed.node "div"
-        []
-        (List.map
-            (\fileBeingUploaded -> Tuple.pair (fileBeingUploaded.id |> String.fromInt) (fileUploader flags fileBeingUploaded))
-            filesBeingUploaded
-        )
 
-
-fileUploader : Flags -> FileBeingUploaded -> Html Msg
-fileUploader flags fileBeingUploaded =
-    Html.node "file-uploader"
-        [ property "fbAuth" flags.fbAuth
-        , property "fileId" (Encode.int fileBeingUploaded.id)
-        , property "file" fileBeingUploaded.value
-        , Html.Events.on "fileUploadProgressed" <|
-            Decode.map2 FileUploadProgressed
-                (Decode.succeed fileBeingUploaded.id)
-                (Decode.at [ "detail", "progress" ] Decode.float)
-        , Html.Events.on "fileUploadErrored" (Decode.succeed <| FileUploadErrored fileBeingUploaded.id)
-        , Html.Events.on "fileUploadCompleted" (Decode.succeed <| FileUploadCompleted fileBeingUploaded.id)
-        ]
-        []
-
-
-keyedTextGetters : FilesBeingRead -> Html Msg
-keyedTextGetters filesBeingRead =
-    Html.Keyed.node
-        "div"
-        []
-        (List.map
-            (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter fileToProcess))
-            filesBeingRead
-        )
-
-
-textGetter : FileBeingRead -> Html Msg
-textGetter fileBeingRead =
-    Html.node "text-getter"
-        [ property "fileId" (Encode.int fileBeingRead.id)
-        , property "file" fileBeingRead.value
-        , Html.Events.on "readText"
-            (Decode.map2 FileTextRead
-                (Decode.succeed fileBeingRead.id)
-                (Decode.at [ "details", "text" ] string)
-            )
-        ]
-        []
+-- keyedFileUploaders : Flags -> FilesBeingUploaded -> Html Msg
+-- keyedFileUploaders flags filesBeingUploaded =
+--     Html.Keyed.node "div"
+--         []
+--         (List.map
+--             (\fileBeingUploaded -> Tuple.pair (fileBeingUploaded.id |> String.fromInt) (fileUploader flags fileBeingUploaded))
+--             filesBeingUploaded
+--         )
+-- fileUploader : Flags -> FileBeingUploaded -> Html Msg
+-- fileUploader flags fileBeingUploaded =
+--     Html.node "file-uploader"
+--         [ property "fbAuth" flags.fbAuth
+--         , property "fileId" (Encode.int fileBeingUploaded.id)
+--         , property "file" fileBeingUploaded.value
+--         , Html.Events.on "fileUploadProgressed" <|
+--             Decode.map2 FileUploadProgressed
+--                 (Decode.succeed fileBeingUploaded.id)
+--                 (Decode.at [ "detail", "progress" ] Decode.float)
+--         , Html.Events.on "fileUploadErrored" (Decode.succeed <| FileUploadErrored fileBeingUploaded.id)
+--         , Html.Events.on "fileUploadCompleted" (Decode.succeed <| FileUploadCompleted fileBeingUploaded.id)
+--         ]
+--         []
+-- keyedTextGetters : FilesBeingRead -> Html Msg
+-- keyedTextGetters filesBeingRead =
+--     Html.Keyed.node
+--         "div"
+--         []
+--         (List.map
+--             (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter fileToProcess))
+--             filesBeingRead
+--         )
+-- textGetter : FileBeingRead -> Html Msg
+-- textGetter fileBeingRead =
+--     Html.node "text-getter"
+--         [ property "fileId" (Encode.int fileBeingRead.id)
+--         , property "file" fileBeingRead.value
+--         , Html.Events.on "readText"
+--             (Decode.map2 FileTextRead
+--                 (Decode.succeed fileBeingRead.id)
+--                 (Decode.at [ "details", "text" ] string)
+--             )
+--         ]
+--         []
 
 
 reportsDisplay : Reports -> Html Msg
