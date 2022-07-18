@@ -5,7 +5,9 @@ import File exposing (File)
 import Html exposing (Attribute, Html, button, div, input, text)
 import Html.Attributes exposing (class, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
-import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, string)
+import Http
+import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, int, string)
+import Json.Encode as Encode
 import Process
 import Task
 import Time exposing (Posix)
@@ -22,9 +24,24 @@ main =
         }
 
 
+
+-- Some constants
+
+
+supabaseURL : String
+supabaseURL =
+    "https://bgwgivatowayfodanvqf.supabase.co"
+
+
+supabaseAnonymousToken : String
+supabaseAnonymousToken =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJnd2dpdmF0b3dheWZvZGFudnFmIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NTY2NTkxNDEsImV4cCI6MTk3MjIzNTE0MX0.AfP9p5wZsXZkSbXwcTGAMwELeB1HtX1Q0iiAvWr5Glw"
+
+
 type alias Model =
     { --  General stuff
-      screenToShow : Screen
+      supabaseAuthorisedToken : String
+    , screenToShow : Screen
 
     -- Login and Sign up stuff
     , email : String
@@ -32,6 +49,9 @@ type alias Model =
     , loginErrors : Errors
     , signUpErrors : Errors
     , currentUsersId : Maybe String
+
+    -- User's data
+    , uploadedFiles : List UploadedFile
 
     -- Files being uploaded
     , lastUsedIndexNumberForFilesBeingUploaded : Int
@@ -117,14 +137,25 @@ type alias Reports =
     List Report
 
 
+type alias UploadedFile =
+    { id : Int
+    , name : String
+    , size : Int
+    , mime : String
+    , createdAt : String
+    }
+
+
 init : () -> ( Model, Cmd msg )
 init _ =
-    ( { screenToShow = Login
+    ( { supabaseAuthorisedToken = ""
+      , screenToShow = Login
       , email = "azurewaters@gmail.com"
       , password = "T3$t(er)"
       , loginErrors = []
       , signUpErrors = []
       , currentUsersId = Nothing
+      , uploadedFiles = []
       , reports = []
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
@@ -144,7 +175,8 @@ type Msg
     | SignUpOnLoginClicked
     | SignUpClicked
     | LoginOnSignUpClicked
-    | UserSignedIn String
+    | UserSignedIn (Result Http.Error String)
+    | FetchedUploadFiles (Result Http.Error (List UploadedFile))
       --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
@@ -173,7 +205,7 @@ update msg model =
         LoginClicked ->
             case Validate.validate loginValidator model of
                 Ok _ ->
-                    ( { model | loginErrors = [] }, signInAUser { email = model.email, password = model.password } )
+                    ( { model | loginErrors = [] }, signInAUser model.email model.password )
 
                 Err errors ->
                     ( { model | loginErrors = errors }, Cmd.none )
@@ -192,18 +224,26 @@ update msg model =
         LoginOnSignUpClicked ->
             ( { model | screenToShow = Login }, Cmd.none )
 
-        UserSignedIn userId ->
-            ( { model
-                | currentUsersId = Just userId
-                , screenToShow =
-                    if userId /= "" then
-                        Display
+        UserSignedIn response ->
+            case response of
+                Ok accessToken ->
+                    ( { model
+                        | supabaseAuthorisedToken = accessToken
+                        , screenToShow = Display
+                      }
+                    , fetchTheUsersUploads model.supabaseAuthorisedToken
+                    )
 
-                    else
-                        Login
-              }
-            , Cmd.none
-            )
+                Err _ ->
+                    ( { model | loginErrors = "Unable to log in" :: model.loginErrors }, Cmd.none )
+
+        FetchedUploadFiles value ->
+            case value of
+                Ok result ->
+                    ( { model | uploadedFiles = result }, Cmd.none )
+
+                Err err ->
+                    ( Debug.log (Debug.toString err) model, Cmd.none )
 
         FilesDropped values ->
             let
@@ -385,9 +425,68 @@ signUpValidator =
 -- Port Outs
 
 
-port signInAUser :
-    { email : String, password : String }
-    -> Cmd msg --  Since we are not expecting any message in return, the return type is the lowercase 'msg'
+signInAUser : String -> String -> Cmd Msg
+signInAUser email password =
+    Http.request
+        { method = "POST"
+        , url = supabaseURL ++ "/auth/v1/token?grant_type=password"
+        , headers =
+            [ Http.header "Content-Type" "application/json"
+            , Http.header "apikey" supabaseAnonymousToken
+            ]
+        , body =
+            Http.jsonBody
+                (Encode.object
+                    [ ( "email", Encode.string email )
+                    , ( "password", Encode.string password )
+                    ]
+                )
+        , expect = Http.expectJson UserSignedIn accessTokenDecoder
+        , timeout = Nothing
+        , tracker = Nothing
+        }
+
+
+accessTokenDecoder : Decode.Decoder String
+accessTokenDecoder =
+    field "access_token" string
+
+
+fetchTheUsersUploads : String -> Cmd Msg
+fetchTheUsersUploads authorisedToken =
+    Http.request
+        { method = "GET"
+        , url = supabaseURL ++ "/rest/v1/UploadedFile?select=id,name,size,mime,createdAt"
+        , headers =
+            [ Http.header "apiKey" supabaseAnonymousToken
+            , Http.header "Authorization" ("Bearer " ++ authorisedToken)
+            ]
+        , body = Http.emptyBody
+        , expect = Http.expectJson FetchedUploadFiles uploadedFilesDecoder
+        , timeout = Nothing
+        , tracker = Nothing
+        }
+
+
+uploadedFilesDecoder : Decode.Decoder (List UploadedFile)
+uploadedFilesDecoder =
+    Decode.list uploadedFileDecoder
+
+
+uploadedFileDecoder : Decode.Decoder UploadedFile
+uploadedFileDecoder =
+    Decode.map5 UploadedFile
+        (field "id" int)
+        (field "name" string)
+        (field "size" int)
+        (field "mime" string)
+        (field "createdAt" string)
+
+
+
+-- port signInAUser :
+--     { email : String, password : String }
+--     -> Cmd msg --  Since we are not expecting any message in return, the return type is the lowercase 'msg'
 
 
 port signUpAUser : { email : String, password : String } -> Cmd msg
@@ -424,14 +523,6 @@ port reportRemoved : (Value -> msg) -> Sub msg
 subscriptions : Model -> Sub Msg
 subscriptions model =
     case model.screenToShow of
-        Login ->
-            Sub.batch
-                [ userSignedIn UserSignedIn
-                ]
-
-        SignUp ->
-            Sub.none
-
         Display ->
             Sub.batch
                 [ reportAdded decodeReportAdded
@@ -441,6 +532,9 @@ subscriptions model =
                 , fileUploadErrored FileUploadErrored
                 , fileUploadCompleted FileUploadCompleted
                 ]
+
+        _ ->
+            Sub.none
 
 
 decodeReportAdded : Value -> Msg
@@ -547,6 +641,7 @@ display model =
     div
         []
         [ filesDropZone model.filesBeingUploaded model.filesBeingRead
+        , uploadedFilesDisplay model.uploadedFiles
         , reportsDisplay model.reports
         ]
 
@@ -588,6 +683,15 @@ getUploadStatus fileToProcess =
 
         ErrorWhileUploading _ ->
             "Problem uploading"
+
+
+uploadedFilesDisplay : List UploadedFile -> Html Msg
+uploadedFilesDisplay uploadedFiles =
+    div []
+        (uploadedFiles
+            |> List.map .name
+            |> List.map text
+        )
 
 
 
