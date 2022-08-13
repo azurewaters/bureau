@@ -1,8 +1,9 @@
 port module Main exposing (..)
 
-import Browser
+import Browser exposing (Document, UrlRequest)
+import Browser.Navigation as Navigation exposing (Key)
 import File exposing (File)
-import Html exposing (Attribute, Html, button, div, input, text)
+import Html exposing (Attribute, Html, button, div, h1, h2, input, text)
 import Html.Attributes exposing (class, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Http
@@ -11,16 +12,20 @@ import Json.Encode as Encode
 import Process
 import Task
 import Time exposing (Posix)
+import Url exposing (Url)
+import Url.Parser as Parser exposing (Parser)
 import Validate exposing (Validator)
 
 
 main : Program () Model Msg
 main =
-    Browser.element
+    Browser.application
         { init = init
         , subscriptions = subscriptions
         , update = update
         , view = view
+        , onUrlRequest = UrlRequested
+        , onUrlChange = UrlChanged
         }
 
 
@@ -30,18 +35,20 @@ main =
 
 supabaseURL : String
 supabaseURL =
-    "https://bgwgivatowayfodanvqf.supabase.co"
+    "https://uwiqgkdwjhdlmjyistoq.supabase.co"
 
 
 supabaseAnonymousToken : String
 supabaseAnonymousToken =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJnd2dpdmF0b3dheWZvZGFudnFmIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NTY2NTkxNDEsImV4cCI6MTk3MjIzNTE0MX0.AfP9p5wZsXZkSbXwcTGAMwELeB1HtX1Q0iiAvWr5Glw"
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV3aXFna2R3amhkbG1qeWlzdG9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NTgxMzIwMjMsImV4cCI6MTk3MzcwODAyM30.d7p38XejbnWMALNPmf8wACaLdhc6TM2AKSdGTWJNJrA"
 
 
 type alias Model =
     { --  General stuff
-      supabaseAuthorisedToken : String
-    , screenToShow : Screen
+      key : Key
+    , url : Url
+    , supabaseAuthorisedToken : String
+    , currentPage : Page
 
     -- Login and Sign up stuff
     , email : String
@@ -67,10 +74,28 @@ type alias Model =
     }
 
 
-type Screen
-    = Login
+type Page
+    = Top
+    | Login
     | SignUp
-    | Display
+    | Home
+    | NotFound
+
+
+urlParser : Parser (Page -> a) a
+urlParser =
+    Parser.oneOf
+        [ Parser.map Top Parser.top
+        , Parser.map Login (Parser.s "login")
+        , Parser.map SignUp (Parser.s "signup")
+        , Parser.map Home (Parser.s "home")
+        ]
+
+
+urlToPage : Url -> Page
+urlToPage url =
+    Parser.parse urlParser url
+        |> Maybe.withDefault NotFound
 
 
 type alias SessionDetails =
@@ -117,6 +142,10 @@ type alias FileBeingRead =
     }
 
 
+type alias FileUploadedResponse =
+    { key : String }
+
+
 type ReadStatus
     = WaitingToBeRead
     | Reading Float
@@ -146,12 +175,14 @@ type alias UploadedFile =
     }
 
 
-init : () -> ( Model, Cmd msg )
-init _ =
-    ( { supabaseAuthorisedToken = ""
-      , screenToShow = Login
+init : () -> Url -> Key -> ( Model, Cmd msg )
+init _ url key =
+    ( { url = url
+      , key = key
+      , supabaseAuthorisedToken = ""
+      , currentPage = urlToPage url
       , email = "azurewaters@gmail.com"
-      , password = "T3$t(er)"
+      , password = "QcGmuuQgpEKpnsSpIqir"
       , loginErrors = []
       , signUpErrors = []
       , currentUsersId = Nothing
@@ -168,8 +199,10 @@ init _ =
 
 
 type Msg
-    = --  Login and registration messages
-      EmailTyped String
+    = UrlChanged Url
+    | UrlRequested UrlRequest
+      --  Login and registration messages
+    | EmailTyped String
     | PasswordTyped String
     | LoginClicked
     | SignUpOnLoginClicked
@@ -177,12 +210,14 @@ type Msg
     | LoginOnSignUpClicked
     | UserSignedIn (Result Http.Error String)
     | FetchedUploadFiles (Result Http.Error (List UploadedFile))
+    | UserSignedUp (Result Http.Error String)
       --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
     | FileUploadErrored Int
     | FileUploadCompleted Int
-    | UnlistUploadedFile Int
+    | DelistUploadedFile Int
+    | FileUploaded Int (Result Http.Error FileUploadedResponse)
       -- File read messages
     | FileTextRead Int String
       --  Reports messages
@@ -196,6 +231,17 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
+        UrlChanged url ->
+            ( { model | url = url }, Cmd.none )
+
+        UrlRequested request ->
+            case request of
+                Browser.Internal url ->
+                    ( model, Navigation.pushUrl model.key (Url.toString url) )
+
+                Browser.External href ->
+                    ( model, Navigation.load href )
+
         EmailTyped email ->
             ( { model | email = email }, Cmd.none )
 
@@ -211,25 +257,26 @@ update msg model =
                     ( { model | loginErrors = errors }, Cmd.none )
 
         SignUpOnLoginClicked ->
-            ( { model | screenToShow = SignUp }, Cmd.none )
+            ( { model | currentPage = SignUp }, Navigation.pushUrl model.key "signup" )
 
         SignUpClicked ->
             case Validate.validate signUpValidator model of
                 Ok _ ->
-                    ( { model | signUpErrors = [] }, signUpAUser { email = model.email, password = model.password } )
+                    ( { model | signUpErrors = [] }
+                    , signUpAUser model.email model.password
+                    )
 
                 Err errors ->
                     ( { model | signUpErrors = errors }, Cmd.none )
 
         LoginOnSignUpClicked ->
-            ( { model | screenToShow = Login }, Cmd.none )
+            ( { model | currentPage = Login }, Navigation.pushUrl model.key "login" )
 
         UserSignedIn response ->
             case response of
                 Ok accessToken ->
                     ( { model
                         | supabaseAuthorisedToken = accessToken
-                        , screenToShow = Display
                       }
                     , fetchTheUsersUploads model.supabaseAuthorisedToken
                     )
@@ -244,6 +291,9 @@ update msg model =
 
                 Err err ->
                     ( Debug.log (Debug.toString err) model, Cmd.none )
+
+        UserSignedUp value ->
+            ( Debug.log (Debug.toString value) model, Cmd.none )
 
         FilesDropped values ->
             let
@@ -299,9 +349,7 @@ update msg model =
                 commandsToUploadTheFiles : List (Cmd Msg)
                 commandsToUploadTheFiles =
                     List.map
-                        (\fileBeingUploaded ->
-                            uploadAFile { id = fileBeingUploaded.id, file = fileBeingUploaded.value }
-                        )
+                        (makeFileUploadRequest model.supabaseAuthorisedToken)
                         newFilesBeingUploaded
             in
             ( { model
@@ -341,11 +389,26 @@ update msg model =
                         id
                         (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploaded })
               }
-            , Task.perform (\_ -> UnlistUploadedFile id) (Process.sleep 3000)
+            , Task.perform (\_ -> DelistUploadedFile id) (Process.sleep 3000)
             )
 
-        UnlistUploadedFile id ->
-            ( { model | filesBeingUploaded = List.filter (\fileBeingUploaded -> fileBeingUploaded.id /= id) model.filesBeingUploaded }, Cmd.none )
+        DelistUploadedFile id ->
+            ( { model
+                | filesBeingUploaded =
+                    List.filter
+                        (\fileBeingUploaded -> fileBeingUploaded.id /= id)
+                        model.filesBeingUploaded
+              }
+            , Cmd.none
+            )
+
+        FileUploaded id response ->
+            case response of
+                Ok key ->
+                    ( model, Task.perform (\_ -> DelistUploadedFile id) (Process.sleep 1000) )
+
+                Err e ->
+                    ( model, Cmd.none )
 
         FileTextRead id textInFile ->
             ( { model
@@ -389,6 +452,32 @@ update msg model =
             ( model, Cmd.none )
 
 
+makeFileUploadRequest : String -> FileBeingUploaded -> Cmd Msg
+makeFileUploadRequest supabaseAuthorisedToken fileBeingUploaded =
+    case decodeValue File.decoder fileBeingUploaded.value of
+        Ok file ->
+            Http.request
+                { method = "POST"
+                , url = supabaseURL ++ "/storage/v1/object/uploads/" ++ File.name file
+                , headers =
+                    [ Http.header "apiKey" supabaseAnonymousToken
+                    , Http.header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
+                    ]
+                , body = Http.fileBody file
+                , expect = Http.expectJson (FileUploaded fileBeingUploaded.id) fileUploadedResponseDecoder
+                , timeout = Nothing
+                , tracker = Nothing
+                }
+
+        Err _ ->
+            Cmd.none
+
+
+fileUploadedResponseDecoder : Decoder FileUploadedResponse
+fileUploadedResponseDecoder =
+    Decode.map FileUploadedResponse (field "key" string)
+
+
 updateFilesBeingUploaded : FilesBeingUploaded -> Int -> (FileBeingUploaded -> FileBeingUploaded) -> FilesBeingUploaded
 updateFilesBeingUploaded filesBeingUploaded id updateFunction =
     List.map
@@ -420,11 +509,6 @@ signUpValidator =
         ]
 
 
-
--- Ports
--- Port Outs
-
-
 signInAUser : String -> String -> Cmd Msg
 signInAUser email password =
     Http.request
@@ -442,6 +526,28 @@ signInAUser email password =
                     ]
                 )
         , expect = Http.expectJson UserSignedIn accessTokenDecoder
+        , timeout = Nothing
+        , tracker = Nothing
+        }
+
+
+signUpAUser : String -> String -> Cmd Msg
+signUpAUser email password =
+    Http.request
+        { method = "POST"
+        , url = supabaseURL ++ "/auth/v1/signup"
+        , headers =
+            [ Http.header "Content-Type" "application/json"
+            , Http.header "apikey" supabaseAnonymousToken
+            ]
+        , body =
+            Http.jsonBody
+                (Encode.object
+                    [ ( "email", Encode.string email )
+                    , ( "password", Encode.string password )
+                    ]
+                )
+        , expect = Http.expectJson UserSignedUp accessTokenDecoder
         , timeout = Nothing
         , tracker = Nothing
         }
@@ -484,12 +590,12 @@ uploadedFileDecoder =
 
 
 
+-- Ports
+-- Port Outs
 -- port signInAUser :
 --     { email : String, password : String }
 --     -> Cmd msg --  Since we are not expecting any message in return, the return type is the lowercase 'msg'
-
-
-port signUpAUser : { email : String, password : String } -> Cmd msg
+-- port signUpAUser : { email : String, password : String } -> Cmd msg
 
 
 port uploadAFile : { id : Int, file : Value } -> Cmd msg
@@ -522,8 +628,8 @@ port reportRemoved : (Value -> msg) -> Sub msg
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
-    case model.screenToShow of
-        Display ->
+    case urlToPage model.url of
+        Home ->
             Sub.batch
                 [ reportAdded decodeReportAdded
                 , reportModified decodeReportModified
@@ -601,49 +707,97 @@ reportDecoder =
 --  VIEWS
 
 
-view : Model -> Html Msg
+cardClasses : Attribute msg
+cardClasses =
+    class "card w-96 bg-base-100 shadow-xl"
+
+
+view : Model -> Document Msg
 view model =
-    case model.screenToShow of
-        Login ->
-            login model
+    { title = "Bureau"
+    , body =
+        case urlToPage model.url of
+            Top ->
+                top
 
-        SignUp ->
-            signUp model
+            Login ->
+                login model
 
-        Display ->
-            display model
+            SignUp ->
+                signUp model
+
+            Home ->
+                home model
+
+            NotFound ->
+                notFound
+    }
 
 
-login : Model -> Html Msg
+top : List (Html Msg)
+top =
+    [ h1 [] [ text "Hello" ], div [] [ text "This is the company's page" ] ]
+
+
+notFound : List (Html Msg)
+notFound =
+    [ h1 [] [ text "Not found" ], div [] [ text "We couldn't find a page like that" ] ]
+
+
+login : Model -> List (Html Msg)
 login model =
-    div []
-        [ input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
-        , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
-        , button [ onClick SignUpOnLoginClicked, class "btn" ] [ text "Sign Up" ]
-        , button [ onClick LoginClicked, class "btn btn-primary" ] [ text "Login" ]
-        , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
+    [ div
+        [ class "w-full h-full grid justify-center content-center" ]
+        [ div
+            [ cardClasses ]
+            [ div
+                [ class "card-body" ]
+                [ h2 [ class "card-title" ] [ text "Login" ]
+                , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
+                , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
+                , div [ class "card-actions justify-between" ]
+                    [ button [ onClick SignUpOnLoginClicked, class "btn" ] [ text "Sign Up" ]
+                    , button [ onClick LoginClicked, class "btn btn-primary" ] [ text "Login" ]
+                    ]
+                ]
+            , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
+            ]
         ]
+    ]
 
 
-signUp : Model -> Html Msg
+signUp : Model -> List (Html Msg)
 signUp model =
-    div []
-        [ input [ type_ "email", required True, placeholder "Your email address", class "input", onInput EmailTyped, value model.email ] []
-        , input [ type_ "password", required True, placeholder "Set a password", class "input", onInput PasswordTyped, value model.password ] []
-        , button [ onClick LoginOnSignUpClicked, class "btn" ] [ text "Login" ]
-        , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
-        , div [] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
+    [ div
+        [ class "w-full h-full grid justify-center content-center" ]
+        [ div
+            [ cardClasses ]
+            [ div [ class "card-body" ]
+                [ h2 [ class "card-title" ] [ text "Sign up" ]
+                , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
+                , input [ type_ "password", required True, placeholder "Set a password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
+                , div
+                    [ class "card-actions justify-between" ]
+                    [ button [ onClick LoginOnSignUpClicked, class "btn" ] [ text "Login" ]
+                    , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
+                    ]
+                ]
+            , div [] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
+            ]
         ]
+    ]
 
 
-display : Model -> Html Msg
-display model =
-    div
+home : Model -> List (Html Msg)
+home model =
+    [ h1 [] [ text model.email ]
+    , div
         []
         [ filesDropZone model.filesBeingUploaded model.filesBeingRead
         , uploadedFilesDisplay model.uploadedFiles
         , reportsDisplay model.reports
         ]
+    ]
 
 
 filesDropZone : FilesBeingUploaded -> FilesBeingRead -> Html Msg
