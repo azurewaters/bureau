@@ -3,8 +3,8 @@ port module Main exposing (..)
 import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
 import File exposing (File)
-import Html exposing (Attribute, Html, button, div, h1, h2, input, text)
-import Html.Attributes exposing (class, placeholder, required, type_, value)
+import Html exposing (Attribute, Html, a, button, div, h1, h2, input, text)
+import Html.Attributes exposing (class, href, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Http
 import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, int, string)
@@ -205,12 +205,12 @@ type Msg
     | EmailTyped String
     | PasswordTyped String
     | LoginClicked
-    | SignUpOnLoginClicked
     | SignUpClicked
-    | LoginOnSignUpClicked
     | UserSignedIn (Result Http.Error String)
     | FetchedUploadFiles (Result Http.Error (List UploadedFile))
     | UserSignedUp (Result Http.Error String)
+      -- Home messages
+    | GoToLoginPageClicked
       --  File upload messages
     | FilesDropped (List Value)
     | FileUploadProgressed Int Float
@@ -256,9 +256,6 @@ update msg model =
                 Err errors ->
                     ( { model | loginErrors = errors }, Cmd.none )
 
-        SignUpOnLoginClicked ->
-            ( { model | currentPage = SignUp }, Navigation.pushUrl model.key "signup" )
-
         SignUpClicked ->
             case Validate.validate signUpValidator model of
                 Ok _ ->
@@ -268,9 +265,6 @@ update msg model =
 
                 Err errors ->
                     ( { model | signUpErrors = errors }, Cmd.none )
-
-        LoginOnSignUpClicked ->
-            ( { model | currentPage = Login }, Navigation.pushUrl model.key "login" )
 
         UserSignedIn response ->
             case response of
@@ -294,6 +288,9 @@ update msg model =
 
         UserSignedUp value ->
             ( Debug.log (Debug.toString value) model, Cmd.none )
+
+        GoToLoginPageClicked ->
+            ( { model | currentPage = Login }, Navigation.pushUrl model.key "login" )
 
         FilesDropped values ->
             let
@@ -755,8 +752,8 @@ login model =
                 [ h2 [ class "card-title" ] [ text "Login" ]
                 , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
                 , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
-                , div [ class "card-actions justify-between" ]
-                    [ button [ onClick SignUpOnLoginClicked, class "btn" ] [ text "Sign Up" ]
+                , div [ class "card-actions justify-between items-center" ]
+                    [ a [ href "/signup" ] [ text "Sign Up" ]
                     , button [ onClick LoginClicked, class "btn btn-primary" ] [ text "Login" ]
                     ]
                 ]
@@ -777,12 +774,12 @@ signUp model =
                 , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
                 , input [ type_ "password", required True, placeholder "Set a password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
                 , div
-                    [ class "card-actions justify-between" ]
-                    [ button [ onClick LoginOnSignUpClicked, class "btn" ] [ text "Login" ]
+                    [ class "card-actions justify-between items-center" ]
+                    [ a [ href "/login" ] [ text "Login" ]
                     , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
                     ]
                 ]
-            , div [] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
+            , div [ class "m-4" ] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
             ]
         ]
     ]
@@ -790,14 +787,33 @@ signUp model =
 
 home : Model -> List (Html Msg)
 home model =
-    [ h1 [] [ text model.email ]
-    , div
-        []
-        [ filesDropZone model.filesBeingUploaded model.filesBeingRead
-        , uploadedFilesDisplay model.uploadedFiles
-        , reportsDisplay model.reports
-        ]
-    ]
+    case model.currentUsersId of
+        Just _ ->
+            [ h1 [] [ text model.email ]
+            , div
+                []
+                [ filesDropZone model.filesBeingUploaded model.filesBeingRead
+                , uploadedFilesDisplay model.uploadedFiles
+                , reportsDisplay model.reports
+                ]
+            ]
+
+        Nothing ->
+            [ div
+                [ class "w-full h-full grid justify-center content-center" ]
+                [ div
+                    [ class "card shadow-xl w-96" ]
+                    [ div [ class "card-body" ]
+                        [ div [ class "card-title" ] [ text "Not logged in" ]
+                        , text "We can't show you anything because you aren't logged in."
+                        , div
+                            [ class "card-actions justify-end" ]
+                            [ button [ class "btn btn-primary", onClick GoToLoginPageClicked ] [ text "Go to login page" ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
 
 
 filesDropZone : FilesBeingUploaded -> FilesBeingRead -> Html Msg
