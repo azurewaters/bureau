@@ -8,3 +8,8 @@ html, body {
   min-width: 100%;
   width: 100%;
 }
+
+.reportDisplay {
+  grid-template-rows: 1fr;
+  grid-template-columns: minmax(0, 1rem) minmax(1rem, 8rem) 1fr;
+}

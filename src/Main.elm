@@ -1,18 +1,18 @@
-port module Main exposing (..)
+module Main exposing (..)
 
 import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
 import File exposing (File)
+import File.Select
 import Html exposing (Attribute, Html, a, button, div, h1, h2, input, text)
 import Html.Attributes exposing (class, href, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
-import Http
+import Http exposing (expectJson, fileBody, header, request)
 import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, int, string)
 import Json.Encode as Encode
-import Process
 import Task
-import Time exposing (Posix)
-import Url exposing (Url)
+import Time exposing (Posix, Zone, millisToPosix)
+import Url exposing (Protocol(..), Url)
 import Url.Parser as Parser exposing (Parser)
 import Validate exposing (Validator)
 
@@ -49,6 +49,8 @@ type alias Model =
     , url : Url
     , supabaseAuthorisedToken : String
     , currentPage : Page
+    , currentTimezone : Zone
+    , currentTime : Posix
 
     -- Login and Sign up stuff
     , email : String
@@ -58,19 +60,11 @@ type alias Model =
     , currentUsersId : Maybe String
 
     -- User's data
-    , uploadedFiles : List UploadedFile
+    , reports : List Report
 
     -- Files being uploaded
     , lastUsedIndexNumberForFilesBeingUploaded : Int
     , filesBeingUploaded : FilesBeingUploaded
-
-    -- Files being read
-    , lastUsedIndexNumberForFilesBeingRead : Int
-    , filesBeingRead : FilesBeingRead
-
-    --  Reports display stuff
-    , reports : Reports
-    , searchTerm : String
     }
 
 
@@ -128,33 +122,16 @@ type alias FilesBeingUploaded =
     List FileBeingUploaded
 
 
-type alias FilesBeingRead =
-    List FileBeingRead
-
-
-type alias FileBeingRead =
-    { id : Int
-    , name : String
-    , size : Int
-    , mime : String
-    , value : Value
-    , readStatus : ReadStatus
-    }
-
-
 type alias FileUploadedResponse =
     { key : String }
 
 
-type ReadStatus
-    = WaitingToBeRead
-    | Reading Float
-    | Read String
-    | ErrorWhileReading String
+type alias AccessDetails =
+    { accessToken : String, userId : String }
 
 
 type alias Report =
-    { id : String
+    { id : Int
     , name : String
     , size : Int
     , mime : String
@@ -162,23 +139,12 @@ type alias Report =
     }
 
 
-type alias Reports =
-    List Report
-
-
-type alias UploadedFile =
-    { id : Int
-    , name : String
-    , size : Int
-    , mime : String
-    , createdAt : String
-    }
-
-
-init : () -> Url -> Key -> ( Model, Cmd msg )
+init : () -> Url -> Key -> ( Model, Cmd Msg )
 init _ url key =
     ( { url = url
       , key = key
+      , currentTimezone = Time.utc
+      , currentTime = Time.millisToPosix 0
       , supabaseAuthorisedToken = ""
       , currentPage = urlToPage url
       , email = "azurewaters@gmail.com"
@@ -186,46 +152,39 @@ init _ url key =
       , loginErrors = []
       , signUpErrors = []
       , currentUsersId = Nothing
-      , uploadedFiles = []
       , reports = []
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
-      , lastUsedIndexNumberForFilesBeingRead = 0
-      , filesBeingRead = []
-      , searchTerm = ""
       }
-    , Cmd.none
+    , Task.perform GotTheTimeZone Time.here
     )
 
 
 type Msg
     = UrlChanged Url
     | UrlRequested UrlRequest
+    | GotTheTimeZone Zone
+    | GotTheTime Posix
+    | DoNothing (Result Http.Error ())
+    | NoOp
       --  Login and registration messages
     | EmailTyped String
     | PasswordTyped String
-    | LoginClicked
+    | LogInClicked
     | SignUpClicked
-    | UserSignedIn (Result Http.Error String)
-    | FetchedUploadFiles (Result Http.Error (List UploadedFile))
+    | UserSignedIn (Result Http.Error AccessDetails)
+    | FetchedUploadedFiles (Result Http.Error (List Report))
     | UserSignedUp (Result Http.Error String)
       -- Home messages
     | GoToLoginPageClicked
+    | LogOutClicked
+    | UploadClicked
+    | FilesSelected File (List File)
       --  File upload messages
     | FilesDropped (List Value)
-    | FileUploadProgressed Int Float
-    | FileUploadErrored Int
-    | FileUploadCompleted Int
-    | DelistUploadedFile Int
-    | FileUploaded Int (Result Http.Error FileUploadedResponse)
-      -- File read messages
-    | FileTextRead Int String
-      --  Reports messages
-    | ReportAdded Report
-    | ReportModified Report
-    | ReportRemoved String
-      --  Miscellaneous
-    | NoOp
+    | FileUploaded FileBeingUploaded (Result Http.Error FileUploadedResponse)
+    | InsertedUploadedFilesDetails (Result Http.Error (List Report))
+    | IgnoreSuccessfulHttpRequests (Result Http.Error ())
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -242,13 +201,19 @@ update msg model =
                 Browser.External href ->
                     ( model, Navigation.load href )
 
+        GotTheTimeZone zone ->
+            ( { model | currentTimezone = zone }, Cmd.none )
+
+        GotTheTime time ->
+            ( { model | currentTime = time }, Cmd.none )
+
         EmailTyped email ->
             ( { model | email = email }, Cmd.none )
 
         PasswordTyped password ->
             ( { model | password = password }, Cmd.none )
 
-        LoginClicked ->
+        LogInClicked ->
             case Validate.validate loginValidator model of
                 Ok _ ->
                     ( { model | loginErrors = [] }, signInAUser model.email model.password )
@@ -266,22 +231,27 @@ update msg model =
                 Err errors ->
                     ( { model | signUpErrors = errors }, Cmd.none )
 
-        UserSignedIn response ->
-            case response of
-                Ok accessToken ->
+        UserSignedIn result ->
+            case result of
+                Ok accessDetails ->
                     ( { model
-                        | supabaseAuthorisedToken = accessToken
+                        | supabaseAuthorisedToken = accessDetails.accessToken
+                        , currentUsersId = Just accessDetails.userId
+                        , currentPage = Home
                       }
-                    , fetchTheUsersUploads model.supabaseAuthorisedToken
+                    , Cmd.batch
+                        [ Navigation.pushUrl model.key "home"
+                        , fetchTheUsersUploadedFiles accessDetails.accessToken
+                        ]
                     )
 
                 Err _ ->
                     ( { model | loginErrors = "Unable to log in" :: model.loginErrors }, Cmd.none )
 
-        FetchedUploadFiles value ->
+        FetchedUploadedFiles value ->
             case value of
                 Ok result ->
-                    ( { model | uploadedFiles = result }, Cmd.none )
+                    ( { model | reports = result }, Cmd.none )
 
                 Err err ->
                     ( Debug.log (Debug.toString err) model, Cmd.none )
@@ -292,6 +262,31 @@ update msg model =
         GoToLoginPageClicked ->
             ( { model | currentPage = Login }, Navigation.pushUrl model.key "login" )
 
+        LogOutClicked ->
+            ( model
+            , request
+                { method = "post"
+                , url = supabaseURL ++ "/auth/v1/logout"
+                , headers =
+                    [ header "apikey" supabaseAnonymousToken
+                    , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                    ]
+                , body = Http.emptyBody
+                , expect = Http.expectWhatever DoNothing
+                , tracker = Nothing
+                , timeout = Nothing
+                }
+            )
+
+        DoNothing _ ->
+            ( { model | currentPage = Top }, Navigation.pushUrl model.key "/" )
+
+        UploadClicked ->
+            ( model, File.Select.files [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] FilesSelected )
+
+        FilesSelected file files ->
+            ( model, Cmd.none )
+
         FilesDropped values ->
             let
                 imageFileValues : List ( File, Value )
@@ -300,7 +295,7 @@ update msg model =
                         (\value ->
                             case decodeValue File.decoder value of
                                 Ok file ->
-                                    if List.member (File.mime file) [ "image/jpeg", "image/png", "application/pdf" ] == True then
+                                    if List.member (File.mime file) [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] == True then
                                         Just ( file, value )
 
                                     else
@@ -346,7 +341,7 @@ update msg model =
                 commandsToUploadTheFiles : List (Cmd Msg)
                 commandsToUploadTheFiles =
                     List.map
-                        (makeFileUploadRequest model.supabaseAuthorisedToken)
+                        (makeFileUploadRequest model.supabaseAuthorisedToken (Maybe.withDefault "" model.currentUsersId))
                         newFilesBeingUploaded
             in
             ( { model
@@ -356,112 +351,81 @@ update msg model =
             , Cmd.batch commandsToUploadTheFiles
             )
 
-        FileUploadProgressed id progress ->
-            ( { model
-                | filesBeingUploaded =
-                    updateFilesBeingUploaded
-                        model.filesBeingUploaded
-                        id
-                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploading progress })
-              }
-            , Cmd.none
-            )
-
-        FileUploadErrored id ->
-            ( { model
-                | filesBeingUploaded =
-                    updateFilesBeingUploaded
-                        model.filesBeingUploaded
-                        id
-                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = ErrorWhileUploading "Error" })
-              }
-            , Cmd.none
-            )
-
-        FileUploadCompleted id ->
-            ( { model
-                | filesBeingUploaded =
-                    updateFilesBeingUploaded
-                        model.filesBeingUploaded
-                        id
-                        (\fileBeingUploaded -> { fileBeingUploaded | uploadStatus = Uploaded })
-              }
-            , Task.perform (\_ -> DelistUploadedFile id) (Process.sleep 3000)
-            )
-
-        DelistUploadedFile id ->
-            ( { model
-                | filesBeingUploaded =
-                    List.filter
-                        (\fileBeingUploaded -> fileBeingUploaded.id /= id)
-                        model.filesBeingUploaded
-              }
-            , Cmd.none
-            )
-
-        FileUploaded id response ->
+        FileUploaded file response ->
+            --  This is where we record it in the database that the file has been uploaded
             case response of
-                Ok key ->
-                    ( model, Task.perform (\_ -> DelistUploadedFile id) (Process.sleep 1000) )
+                Ok _ ->
+                    ( model
+                    , Cmd.batch
+                        [ request
+                            { method = "POST"
+                            , url = supabaseURL ++ "/rest/v1/reports"
+                            , headers =
+                                [ header "apiKey" supabaseAnonymousToken
+                                , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                                , header "Prefer" "return=representation" --  This can be "representation" or "minimal"; "representation" returns the row just inserted, and minimal returns absolutely nothing
+                                ]
+                            , body =
+                                Http.jsonBody
+                                    (Encode.object
+                                        [ ( "name", Encode.string file.name )
+                                        , ( "size", Encode.int file.size )
+                                        , ( "mime", Encode.string file.mime )
+                                        , ( "userId", Encode.string <| Maybe.withDefault "" model.currentUsersId )
+                                        , ( "uploadedOn", Encode.int <| Time.posixToMillis model.currentTime )
+                                        ]
+                                    )
+                            , expect = expectJson InsertedUploadedFilesDetails reportsDecoder
+                            , timeout = Nothing
+                            , tracker = Nothing
+                            }
+                        ]
+                    )
 
                 Err e ->
+                    ( Debug.log (Debug.toString e) model, Cmd.none )
+
+        InsertedUploadedFilesDetails result ->
+            case result of
+                Ok reports ->
+                    ( { model | reports = List.append model.reports reports }, Cmd.none )
+
+                Err e ->
+                    ( Debug.log ("InsertedUploadedFilesDetails - " ++ Debug.toString e) model, Cmd.none )
+
+        IgnoreSuccessfulHttpRequests result ->
+            case result of
+                Ok _ ->
                     ( model, Cmd.none )
 
-        FileTextRead id textInFile ->
-            ( { model
-                | filesBeingRead =
-                    List.map
-                        (\fileBeingRead ->
-                            if id == fileBeingRead.id then
-                                { fileBeingRead | readStatus = Read textInFile }
-
-                            else
-                                fileBeingRead
-                        )
-                        model.filesBeingRead
-              }
-            , Cmd.none
-            )
-
-        ReportAdded newReport ->
-            ( { model | reports = List.append model.reports [ newReport ] }, Cmd.none )
-
-        ReportModified modifiedReport ->
-            ( { model
-                | reports =
-                    List.map
-                        (\report ->
-                            if report.id == modifiedReport.id then
-                                modifiedReport
-
-                            else
-                                report
-                        )
-                        model.reports
-              }
-            , Cmd.none
-            )
-
-        ReportRemoved id ->
-            ( { model | reports = List.filter (\report -> report.id /= id) model.reports }, Cmd.none )
+                Err e ->
+                    ( Debug.log (Debug.toString e) model, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
 
 
-makeFileUploadRequest : String -> FileBeingUploaded -> Cmd Msg
-makeFileUploadRequest supabaseAuthorisedToken fileBeingUploaded =
+checkIfCharactersAreAWSSafe : String -> Bool
+checkIfCharactersAreAWSSafe s =
+    -- Unsafe character names have to be checked
+    [ "\\", "{", "^", "}", "%", "`", "]", "\"", "'", ">", "[", "~", "<", "#", "|" ]
+        |> List.map (\c -> String.contains c s)
+        |> List.foldl (&&) True
+
+
+makeFileUploadRequest : String -> String -> FileBeingUploaded -> Cmd Msg
+makeFileUploadRequest supabaseAuthorisedToken userId fileBeingUploaded =
     case decodeValue File.decoder fileBeingUploaded.value of
         Ok file ->
-            Http.request
+            request
                 { method = "POST"
-                , url = supabaseURL ++ "/storage/v1/object/uploads/" ++ File.name file
+                , url = supabaseURL ++ "/storage/v1/object/reports/" ++ userId ++ "/" ++ File.name file
                 , headers =
-                    [ Http.header "apiKey" supabaseAnonymousToken
-                    , Http.header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
+                    [ header "apiKey" supabaseAnonymousToken
+                    , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
                     ]
-                , body = Http.fileBody file
-                , expect = Http.expectJson (FileUploaded fileBeingUploaded.id) fileUploadedResponseDecoder
+                , body = fileBody file
+                , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
                 , timeout = Nothing
                 , tracker = Nothing
                 }
@@ -472,7 +436,7 @@ makeFileUploadRequest supabaseAuthorisedToken fileBeingUploaded =
 
 fileUploadedResponseDecoder : Decoder FileUploadedResponse
 fileUploadedResponseDecoder =
-    Decode.map FileUploadedResponse (field "key" string)
+    Decode.map FileUploadedResponse (field "Key" string)
 
 
 updateFilesBeingUploaded : FilesBeingUploaded -> Int -> (FileBeingUploaded -> FileBeingUploaded) -> FilesBeingUploaded
@@ -512,8 +476,8 @@ signInAUser email password =
         { method = "POST"
         , url = supabaseURL ++ "/auth/v1/token?grant_type=password"
         , headers =
-            [ Http.header "Content-Type" "application/json"
-            , Http.header "apikey" supabaseAnonymousToken
+            [ header "apikey" supabaseAnonymousToken
+            , header "Content-Type" "application/json"
             ]
         , body =
             Http.jsonBody
@@ -522,7 +486,7 @@ signInAUser email password =
                     , ( "password", Encode.string password )
                     ]
                 )
-        , expect = Http.expectJson UserSignedIn accessTokenDecoder
+        , expect = Http.expectJson UserSignedIn accessDetailsDecoder
         , timeout = Nothing
         , tracker = Nothing
         }
@@ -534,8 +498,8 @@ signUpAUser email password =
         { method = "POST"
         , url = supabaseURL ++ "/auth/v1/signup"
         , headers =
-            [ Http.header "Content-Type" "application/json"
-            , Http.header "apikey" supabaseAnonymousToken
+            [ header "apikey" supabaseAnonymousToken
+            , header "Content-Type" "application/json"
             ]
         , body =
             Http.jsonBody
@@ -550,163 +514,63 @@ signUpAUser email password =
         }
 
 
-accessTokenDecoder : Decode.Decoder String
+accessTokenDecoder : Decoder String
 accessTokenDecoder =
     field "access_token" string
 
 
-fetchTheUsersUploads : String -> Cmd Msg
-fetchTheUsersUploads authorisedToken =
+userIdDecoder : Decoder String
+userIdDecoder =
+    Decode.at [ "user", "id" ] string
+
+
+accessDetailsDecoder : Decoder AccessDetails
+accessDetailsDecoder =
+    Decode.map2 AccessDetails accessTokenDecoder userIdDecoder
+
+
+fetchTheUsersUploadedFiles : String -> Cmd Msg
+fetchTheUsersUploadedFiles authorisedToken =
     Http.request
         { method = "GET"
-        , url = supabaseURL ++ "/rest/v1/UploadedFile?select=id,name,size,mime,createdAt"
+        , url = supabaseURL ++ "/rest/v1/reports?select=id,name,size,mime,uploadedOn"
         , headers =
-            [ Http.header "apiKey" supabaseAnonymousToken
-            , Http.header "Authorization" ("Bearer " ++ authorisedToken)
+            [ header "apiKey" supabaseAnonymousToken
+            , header "Authorization" ("Bearer " ++ authorisedToken)
             ]
         , body = Http.emptyBody
-        , expect = Http.expectJson FetchedUploadFiles uploadedFilesDecoder
+        , expect = Http.expectJson FetchedUploadedFiles reportsDecoder
         , timeout = Nothing
         , tracker = Nothing
         }
 
 
-uploadedFilesDecoder : Decode.Decoder (List UploadedFile)
-uploadedFilesDecoder =
-    Decode.list uploadedFileDecoder
-
-
-uploadedFileDecoder : Decode.Decoder UploadedFile
-uploadedFileDecoder =
-    Decode.map5 UploadedFile
-        (field "id" int)
-        (field "name" string)
-        (field "size" int)
-        (field "mime" string)
-        (field "createdAt" string)
-
-
-
--- Ports
--- Port Outs
--- port signInAUser :
---     { email : String, password : String }
---     -> Cmd msg --  Since we are not expecting any message in return, the return type is the lowercase 'msg'
--- port signUpAUser : { email : String, password : String } -> Cmd msg
-
-
-port uploadAFile : { id : Int, file : Value } -> Cmd msg
-
-
-
--- Port Ins
-
-
-port userSignedIn : (String -> msg) -> Sub msg
-
-
-port fileUploadProgressed : (Value -> msg) -> Sub msg
-
-
-port fileUploadErrored : (Int -> msg) -> Sub msg
-
-
-port fileUploadCompleted : (Int -> msg) -> Sub msg
-
-
-port reportAdded : (Value -> msg) -> Sub msg
-
-
-port reportModified : (Value -> msg) -> Sub msg
-
-
-port reportRemoved : (Value -> msg) -> Sub msg
-
-
-subscriptions : Model -> Sub Msg
-subscriptions model =
-    case urlToPage model.url of
-        Home ->
-            Sub.batch
-                [ reportAdded decodeReportAdded
-                , reportModified decodeReportModified
-                , reportRemoved decodeReportRemoved
-                , fileUploadProgressed decodeFileUploadProgress
-                , fileUploadErrored FileUploadErrored
-                , fileUploadCompleted FileUploadCompleted
-                ]
-
-        _ ->
-            Sub.none
-
-
-decodeReportAdded : Value -> Msg
-decodeReportAdded value =
-    case decodeValue reportDecoder value of
-        Ok report ->
-            ReportAdded report
-
-        Err error ->
-            Debug.log ("Error while decoding report:" ++ Debug.toString error ++ Debug.toString value) NoOp
-
-
-decodeReportModified : Value -> Msg
-decodeReportModified value =
-    case decodeValue reportDecoder value of
-        Ok report ->
-            ReportModified report
-
-        Err error ->
-            Debug.log ("Error while decoding report:" ++ Debug.toString error ++ Debug.toString value) NoOp
-
-
-decodeReportRemoved : Value -> Msg
-decodeReportRemoved value =
-    case decodeValue string value of
-        Ok id ->
-            ReportRemoved id
-
-        Err error ->
-            Debug.log ("Error while decoding report id:" ++ Debug.toString error ++ Debug.toString value) NoOp
-
-
-decodeFileUploadProgress : Value -> Msg
-decodeFileUploadProgress value =
-    case decodeValue fileUploadProgressDecoder value of
-        Ok ( id, progress ) ->
-            FileUploadProgressed id progress
-
-        Err _ ->
-            NoOp
-
-
-fileUploadProgressDecoder : Decoder ( Int, Float )
-fileUploadProgressDecoder =
-    Decode.map2 Tuple.pair (field "id" Decode.int) (field "progress" Decode.float)
-
-
-reportsDecoder : Decoder Reports
+reportsDecoder : Decode.Decoder (List Report)
 reportsDecoder =
     Decode.list reportDecoder
 
 
-reportDecoder : Decoder Report
+reportDecoder : Decode.Decoder Report
 reportDecoder =
     Decode.map5 Report
-        (field "id" string)
+        (field "id" int)
         (field "name" string)
-        (field "size" Decode.int)
+        (field "size" int)
         (field "mime" string)
-        (field "uploadedOn" Decode.int |> Decode.map Time.millisToPosix)
+        (field "uploadedOn" int |> Decode.map millisToPosix)
+
+
+
+-- SUBSCRIPTIONS
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _ =
+    Sub.batch [ Time.every 1000 GotTheTime ]
 
 
 
 --  VIEWS
-
-
-cardClasses : Attribute msg
-cardClasses =
-    class "card w-96 bg-base-100 shadow-xl"
 
 
 view : Model -> Document Msg
@@ -718,7 +582,7 @@ view model =
                 top
 
             Login ->
-                login model
+                logIn model
 
             SignUp ->
                 signUp model
@@ -741,23 +605,23 @@ notFound =
     [ h1 [] [ text "Not found" ], div [] [ text "We couldn't find a page like that" ] ]
 
 
-login : Model -> List (Html Msg)
-login model =
+logIn : Model -> List (Html Msg)
+logIn model =
     [ div
         [ class "w-full h-full grid justify-center content-center" ]
         [ div
             [ cardClasses ]
             [ div
                 [ class "card-body" ]
-                [ h2 [ class "card-title" ] [ text "Login" ]
+                [ h2 [ class "card-title" ] [ text "Log in" ]
                 , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
                 , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
                 , div [ class "card-actions justify-between items-center" ]
-                    [ a [ href "/signup" ] [ text "Sign Up" ]
-                    , button [ onClick LoginClicked, class "btn btn-primary" ] [ text "Login" ]
+                    [ a [ href "/signup" ] [ text "Sign up" ]
+                    , button [ onClick LogInClicked, class "btn btn-primary" ] [ text "Log in" ]
                     ]
+                , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
                 ]
-            , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
             ]
         ]
     ]
@@ -775,7 +639,7 @@ signUp model =
                 , input [ type_ "password", required True, placeholder "Set a password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
                 , div
                     [ class "card-actions justify-between items-center" ]
-                    [ a [ href "/login" ] [ text "Login" ]
+                    [ a [ href "/login" ] [ text "Log in" ]
                     , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
                     ]
                 ]
@@ -787,58 +651,44 @@ signUp model =
 
 home : Model -> List (Html Msg)
 home model =
-    case model.currentUsersId of
-        Just _ ->
-            [ h1 [] [ text model.email ]
-            , div
-                []
-                [ filesDropZone model.filesBeingUploaded model.filesBeingRead
-                , uploadedFilesDisplay model.uploadedFiles
-                , reportsDisplay model.reports
-                ]
-            ]
-
-        Nothing ->
+    if model.supabaseAuthorisedToken == "" then
+        --  The user's not logged in
+        [ div
+            [ class "w-full h-full grid justify-center content-center" ]
             [ div
-                [ class "w-full h-full grid justify-center content-center" ]
-                [ div
-                    [ class "card shadow-xl w-96" ]
-                    [ div [ class "card-body" ]
-                        [ div [ class "card-title" ] [ text "Not logged in" ]
-                        , text "We can't show you anything because you aren't logged in."
-                        , div
-                            [ class "card-actions justify-end" ]
-                            [ button [ class "btn btn-primary", onClick GoToLoginPageClicked ] [ text "Go to login page" ]
-                            ]
+                [ class "card shadow-xl w-96" ]
+                [ div [ class "card-body" ]
+                    [ div [ class "card-title" ] [ text "Not logged in" ]
+                    , text "We can't show you anything because you aren't logged in."
+                    , div
+                        [ class "card-actions justify-end" ]
+                        [ button [ class "btn btn-primary", onClick GoToLoginPageClicked ] [ text "Go to Log In page" ]
                         ]
                     ]
                 ]
             ]
-
-
-filesDropZone : FilesBeingUploaded -> FilesBeingRead -> Html Msg
-filesDropZone filesBeingUploaded filesBeingRead =
-    div
-        [ onFilesDrop FilesDropped
-        , onDragOver NoOp
         ]
-        (List.concat
-            [ [ div [] [ text "Drag a report here to upload" ] ]
-            , List.map fileDisplay filesBeingUploaded
 
-            -- , [ keyedFileUploaders flags filesBeingUploaded ]
-            -- , [ keyedTextGetters filesBeingRead ]
+    else
+        --  Show the user their files
+        let
+            sortedFiles =
+                List.sortWith (comparePosix model.currentTimezone) model.reports
+                    |> List.reverse
+        in
+        [ div
+            [ class "w-full pb-8 px-8 grid grid-cols-1 gap-4 justify-start content-start card"
             ]
-        )
-
-
-fileDisplay : FileBeingUploaded -> Html Msg
-fileDisplay fileToProcess =
-    div
-        []
-        [ fileToProcess.id |> String.fromInt |> text
-        , text " - "
-        , getUploadStatus fileToProcess |> text
+            [ div
+                [ class "card-body" ]
+                [ div
+                    [ class "card-actions justify-between" ]
+                    [ div [] [ text model.email ]
+                    , button [ class "btn btn-ghost", onClick LogOutClicked ] [ text "Log out" ]
+                    ]
+                , reportsDisplay sortedFiles model.currentTimezone
+                ]
+            ]
         ]
 
 
@@ -855,95 +705,98 @@ getUploadStatus fileToProcess =
             "Problem uploading"
 
 
-uploadedFilesDisplay : List UploadedFile -> Html Msg
-uploadedFilesDisplay uploadedFiles =
-    div []
-        (uploadedFiles
-            |> List.map .name
-            |> List.map text
-        )
-
-
-
--- keyedFileUploaders : Flags -> FilesBeingUploaded -> Html Msg
--- keyedFileUploaders flags filesBeingUploaded =
---     Html.Keyed.node "div"
---         []
---         (List.map
---             (\fileBeingUploaded -> Tuple.pair (fileBeingUploaded.id |> String.fromInt) (fileUploader flags fileBeingUploaded))
---             filesBeingUploaded
---         )
--- fileUploader : Flags -> FileBeingUploaded -> Html Msg
--- fileUploader flags fileBeingUploaded =
---     Html.node "file-uploader"
---         [ property "fbAuth" flags.fbAuth
---         , property "fileId" (Encode.int fileBeingUploaded.id)
---         , property "file" fileBeingUploaded.value
---         , Html.Events.on "fileUploadProgressed" <|
---             Decode.map2 FileUploadProgressed
---                 (Decode.succeed fileBeingUploaded.id)
---                 (Decode.at [ "detail", "progress" ] Decode.float)
---         , Html.Events.on "fileUploadErrored" (Decode.succeed <| FileUploadErrored fileBeingUploaded.id)
---         , Html.Events.on "fileUploadCompleted" (Decode.succeed <| FileUploadCompleted fileBeingUploaded.id)
---         ]
---         []
--- keyedTextGetters : FilesBeingRead -> Html Msg
--- keyedTextGetters filesBeingRead =
---     Html.Keyed.node
---         "div"
---         []
---         (List.map
---             (\fileToProcess -> Tuple.pair (fileToProcess.id |> String.fromInt) (textGetter fileToProcess))
---             filesBeingRead
---         )
--- textGetter : FileBeingRead -> Html Msg
--- textGetter fileBeingRead =
---     Html.node "text-getter"
---         [ property "fileId" (Encode.int fileBeingRead.id)
---         , property "file" fileBeingRead.value
---         , Html.Events.on "readText"
---             (Decode.map2 FileTextRead
---                 (Decode.succeed fileBeingRead.id)
---                 (Decode.at [ "details", "text" ] string)
---             )
---         ]
---         []
-
-
-reportsDisplay : Reports -> Html Msg
-reportsDisplay reports =
+reportsDisplay : List Report -> Zone -> Html Msg
+reportsDisplay reports zone =
     div
-        []
-        (div [] [ text "Reports" ] :: List.map reportDisplay reports)
-
-
-reportDisplay : Report -> Html Msg
-reportDisplay report =
-    div
-        []
-        [ text report.name
-        , div []
-            [ text
-                (String.join " : "
-                    [ report.size |> String.fromInt
-                    , report.uploadedOn |> getDateFromPosix
-                    ]
-                )
+        [ cardClasses
+        , onFilesDrop FilesDropped
+        , onDragOver NoOp
+        ]
+        [ div
+            [ class "card-body" ]
+            [ div [ class "card-title" ] [ text "Your reports" ]
+            , div
+                [ class "grid w-full" ]
+                (List.indexedMap (reportDisplay zone) reports)
+            , div
+                [ class "card-actions justify-end" ]
+                [ button [ class "btn", onClick UploadClicked ] [ text "Upload" ] ]
             ]
         ]
 
 
-getDateFromPosix : Posix -> String
-getDateFromPosix posix =
-    String.join " "
-        [ Time.toYear Time.utc posix |> String.fromInt
-        , Time.toMonth Time.utc posix |> getMonthNameFromMonth
-        , Time.toDay Time.utc posix |> String.fromInt
+reportDisplay : Zone -> Int -> Report -> Html Msg
+reportDisplay zone index report =
+    div
+        [ class "reportDisplay"
+        , class "w-full grid gap-4"
+        ]
+        [ div [ class "text-right" ] [ index + 1 |> String.fromInt |> text ]
+        , div [ class "overflow-hidden" ] [ getDisplayDate zone report.uploadedOn |> text ]
+        , div [ class "overflow-hidden" ] [ text report.name ]
         ]
 
 
-getMonthNameFromMonth : Time.Month -> String
-getMonthNameFromMonth month =
+
+-- HELPER FUNCTIONS
+
+
+comparePosix : Zone -> Report -> Report -> Order
+comparePosix zone a b =
+    compare (Time.toMillis zone a.uploadedOn) (Time.toMillis zone b.uploadedOn)
+
+
+cardClasses : Attribute msg
+cardClasses =
+    class "card bg-base-100 shadow-xl border border-slate-100"
+
+
+getDisplayDate : Zone -> Posix -> String
+getDisplayDate zone time =
+    String.join " "
+        [ Time.toYear zone time |> String.fromInt
+        , Time.toMonth zone time |> getMonthName
+        , Time.toDay zone time |> String.fromInt
+        , if zone == Time.utc then
+            " UTC"
+
+          else
+            ""
+        ]
+
+
+onDragStart : Msg -> Attribute Msg
+onDragStart msg =
+    on "dragstart" (Decode.succeed msg)
+
+
+onDragOver : Msg -> Attribute Msg
+onDragOver msg =
+    preventDefaultOn "dragover" (Decode.succeed ( msg, True ))
+
+
+onDrop : Msg -> Attribute Msg
+onDrop msg =
+    preventDefaultOn "drop" (Decode.succeed ( msg, True ))
+
+
+onFilesDrop : (List Value -> Msg) -> Attribute Msg
+onFilesDrop msg =
+    preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
+
+
+filesDecoder : Decoder (List Value)
+filesDecoder =
+    Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
+
+
+onDragEnd : Msg -> Attribute Msg
+onDragEnd msg =
+    on "dragend" (Decode.succeed msg)
+
+
+getMonthName : Time.Month -> String
+getMonthName month =
     case month of
         Time.Jan ->
             "Jan"
@@ -980,33 +833,3 @@ getMonthNameFromMonth month =
 
         Time.Dec ->
             "Dec"
-
-
-onDragStart : Msg -> Attribute Msg
-onDragStart msg =
-    on "dragstart" (Decode.succeed msg)
-
-
-onDragOver : Msg -> Attribute Msg
-onDragOver msg =
-    preventDefaultOn "dragover" (Decode.succeed ( msg, True ))
-
-
-onDrop : Msg -> Attribute Msg
-onDrop msg =
-    preventDefaultOn "drop" (Decode.succeed ( msg, True ))
-
-
-onFilesDrop : (List Value -> Msg) -> Attribute Msg
-onFilesDrop msg =
-    preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
-
-
-filesDecoder : Decoder (List Value)
-filesDecoder =
-    Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
-
-
-onDragEnd : Msg -> Attribute Msg
-onDragEnd msg =
-    on "dragend" (Decode.succeed msg)
