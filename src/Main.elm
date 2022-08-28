@@ -4,14 +4,16 @@ import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
 import File exposing (File)
 import File.Select
-import Html exposing (Attribute, Html, a, button, div, h1, h2, input, text)
-import Html.Attributes exposing (class, href, placeholder, required, type_, value)
+import Html exposing (Attribute, Html, a, button, div, h1, h2, h3, input, li, ol, p, text)
+import Html.Attributes exposing (class, classList, disabled, href, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
-import Http exposing (expectJson, fileBody, header, request)
-import Json.Decode as Decode exposing (Decoder, Error(..), Value, decodeValue, field, int, string)
+import Http exposing (emptyBody, expectJson, expectWhatever, fileBody, header, request)
+import Json.Decode as Decode exposing (Decoder, Error(..), field, int, string)
 import Json.Encode as Encode
+import Process
+import Set exposing (Set)
 import Task
-import Time exposing (Posix, Zone, millisToPosix)
+import Time exposing (Posix, Zone)
 import Url exposing (Protocol(..), Url)
 import Url.Parser as Parser exposing (Parser)
 import Validate exposing (Validator)
@@ -50,7 +52,6 @@ type alias Model =
     , supabaseAuthorisedToken : String
     , currentPage : Page
     , currentTimezone : Zone
-    , currentTime : Posix
 
     -- Login and Sign up stuff
     , email : String
@@ -59,8 +60,13 @@ type alias Model =
     , signUpErrors : Errors
     , currentUsersId : Maybe String
 
+    -- Home stuff
+    , selectedReportIds : List ReportId
+    , showDeleteReportsConfirmation : Bool
+
     -- User's data
     , reports : List Report
+    , errors : Errors
 
     -- Files being uploaded
     , lastUsedIndexNumberForFilesBeingUploaded : Int
@@ -104,10 +110,7 @@ type alias Errors =
 
 type alias FileBeingUploaded =
     { id : Int
-    , name : String
-    , size : Int
-    , mime : String
-    , value : Value
+    , file : File
     , uploadStatus : UploadStatus
     }
 
@@ -131,7 +134,7 @@ type alias AccessDetails =
 
 
 type alias Report =
-    { id : Int
+    { id : ReportId
     , name : String
     , size : Int
     , mime : String
@@ -139,12 +142,15 @@ type alias Report =
     }
 
 
+type alias ReportId =
+    Int
+
+
 init : () -> Url -> Key -> ( Model, Cmd Msg )
 init _ url key =
     ( { url = url
       , key = key
       , currentTimezone = Time.utc
-      , currentTime = Time.millisToPosix 0
       , supabaseAuthorisedToken = ""
       , currentPage = urlToPage url
       , email = "azurewaters@gmail.com"
@@ -152,7 +158,10 @@ init _ url key =
       , loginErrors = []
       , signUpErrors = []
       , currentUsersId = Nothing
+      , selectedReportIds = []
+      , showDeleteReportsConfirmation = False
       , reports = []
+      , errors = []
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
       }
@@ -164,9 +173,9 @@ type Msg
     = UrlChanged Url
     | UrlRequested UrlRequest
     | GotTheTimeZone Zone
-    | GotTheTime Posix
     | DoNothing (Result Http.Error ())
     | NoOp
+    | DelistErrors
       --  Login and registration messages
     | EmailTyped String
     | PasswordTyped String
@@ -180,9 +189,15 @@ type Msg
     | LogOutClicked
     | UploadClicked
     | FilesSelected File (List File)
+    | ToggleSelection ReportId
+    | DeleteClicked
+    | DeleteReportsConfirmationDeleteClicked
+    | DeleteReportsConfirmationCloseClicked
+    | ReportDeleted ReportId (Result Http.Error ())
       --  File upload messages
-    | FilesDropped (List Value)
+    | FilesDropped (List File)
     | FileUploaded FileBeingUploaded (Result Http.Error FileUploadedResponse)
+    | InsertUploadedFilesDetails FileBeingUploaded Posix
     | InsertedUploadedFilesDetails (Result Http.Error (List Report))
     | IgnoreSuccessfulHttpRequests (Result Http.Error ())
 
@@ -203,9 +218,6 @@ update msg model =
 
         GotTheTimeZone zone ->
             ( { model | currentTimezone = zone }, Cmd.none )
-
-        GotTheTime time ->
-            ( { model | currentTime = time }, Cmd.none )
 
         EmailTyped email ->
             ( { model | email = email }, Cmd.none )
@@ -287,103 +299,206 @@ update msg model =
         FilesSelected file files ->
             ( model, Cmd.none )
 
-        FilesDropped values ->
+        ToggleSelection reportId ->
             let
-                imageFileValues : List ( File, Value )
-                imageFileValues =
-                    List.filterMap
-                        (\value ->
-                            case decodeValue File.decoder value of
-                                Ok file ->
-                                    if List.member (File.mime file) [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] == True then
-                                        Just ( file, value )
+                newSelectedReports =
+                    if List.member reportId model.selectedReportIds then
+                        List.filter (\rId -> rId /= reportId) model.selectedReportIds
 
-                                    else
-                                        Nothing
+                    else
+                        reportId :: model.selectedReportIds
+            in
+            ( { model | selectedReportIds = newSelectedReports }, Cmd.none )
 
-                                Err _ ->
-                                    Nothing
+        DeleteClicked ->
+            --  Confirm if they indeed want to delete
+            ( { model | showDeleteReportsConfirmation = True }, Cmd.none )
+
+        DeleteReportsConfirmationDeleteClicked ->
+            --  Now, go ahead and delete the selected reports
+            let
+                requestsToDelete : List (Cmd Msg)
+                requestsToDelete =
+                    List.map (makeDeleteReportRequest model.supabaseAuthorisedToken) model.selectedReportIds
+            in
+            ( { model | showDeleteReportsConfirmation = False, selectedReportIds = [] }
+            , Cmd.batch requestsToDelete
+            )
+
+        DeleteReportsConfirmationCloseClicked ->
+            ( { model | showDeleteReportsConfirmation = False }, Cmd.none )
+
+        ReportDeleted reportId result ->
+            let
+                maybeReportWithThisId =
+                    List.filter (\r -> r.id == reportId) model.reports
+                        |> List.head
+
+                maybeRequestToRemoveFromStorage : Maybe (Cmd Msg)
+                maybeRequestToRemoveFromStorage =
+                    Maybe.map
+                        (\report ->
+                            request
+                                { method = "DELETE"
+                                , headers =
+                                    [ header "apiKey" supabaseAnonymousToken
+                                    , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                                    ]
+                                , url = supabaseURL ++ "/storage/v1/object/reports/" ++ Maybe.withDefault "" model.currentUsersId ++ "/" ++ report.name
+                                , body = emptyBody
+                                , expect = expectWhatever IgnoreSuccessfulHttpRequests
+                                , timeout = Nothing
+                                , tracker = Nothing
+                                }
                         )
-                        values
+                        maybeReportWithThisId
+            in
+            case result of
+                Ok _ ->
+                    ( { model | reports = List.filter (\report -> report.id /= reportId) model.reports }
+                    , Maybe.withDefault Cmd.none maybeRequestToRemoveFromStorage
+                    )
+
+                Err error ->
+                    ( { model | errors = ("Report " ++ String.fromInt reportId ++ " could not be uploaded. The error reported was " ++ Debug.log (Debug.toString error) "") :: model.errors }
+                    , Cmd.none
+                    )
+
+        FilesDropped files ->
+            let
+                imageFiles : List File
+                imageFiles =
+                    List.filter itIsAnImage files
 
                 namesOfFilesAlreadyBeingUploaded : List String
                 namesOfFilesAlreadyBeingUploaded =
-                    List.map .name model.filesBeingUploaded
+                    model.filesBeingUploaded
+                        --  Files that had problems when last uploaded
+                        --  should be allowed to be uplodaded again
+                        |> List.filter
+                            (\fbu ->
+                                case fbu.uploadStatus of
+                                    ErrorWhileUploading _ ->
+                                        False
 
-                uniqueImageFileValues : List ( File, Value )
-                uniqueImageFileValues =
+                                    _ ->
+                                        True
+                            )
+                        |> List.map (\fbu -> File.name fbu.file)
+
+                namesOfReportsFiles : List String
+                namesOfReportsFiles =
+                    List.map .name model.reports
+
+                fileNamesToCheckAgainst : List String
+                fileNamesToCheckAgainst =
+                    List.concat [ namesOfFilesAlreadyBeingUploaded, namesOfReportsFiles ]
+
+                uniqueImageFiles : List File
+                uniqueImageFiles =
                     List.filter
-                        (\( file, _ ) ->
-                            List.member (File.name file) namesOfFilesAlreadyBeingUploaded
-                                |> not
-                        )
-                        imageFileValues
+                        (\file -> not <| List.member (File.name file) fileNamesToCheckAgainst)
+                        imageFiles
 
                 idsToUse : List Int
                 idsToUse =
-                    List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFileValues)
+                    List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles)
 
                 newFilesBeingUploaded : FilesBeingUploaded
                 newFilesBeingUploaded =
                     List.map2
-                        (\id ( file, value ) ->
+                        (\id file ->
                             { id = id
-                            , name = File.name file
-                            , size = File.size file
-                            , mime = File.mime file
-                            , value = value
+                            , file = file
                             , uploadStatus = Uploading 0
                             }
                         )
                         idsToUse
-                        uniqueImageFileValues
+                        uniqueImageFiles
 
                 commandsToUploadTheFiles : List (Cmd Msg)
                 commandsToUploadTheFiles =
                     List.map
                         (makeFileUploadRequest model.supabaseAuthorisedToken (Maybe.withDefault "" model.currentUsersId))
                         newFilesBeingUploaded
+
+                -- Now find the errors
+                --  First, the files that aren't images
+                --  Second, the files that are already being uploaded
+                fileNames : Set String
+                fileNames =
+                    List.map File.name files
+                        |> Set.fromList
+
+                errorsAboutFilesThatArentImages : List String
+                errorsAboutFilesThatArentImages =
+                    let
+                        imageFileNames =
+                            Set.fromList <| List.map File.name imageFiles
+                    in
+                    Set.diff fileNames imageFileNames
+                        |> Set.map (\fn -> "The file '" ++ fn ++ "' is not an image and won't be uploaded.")
+                        |> Set.toList
+
+                errorsAboutFilesThatAreAlreadyOnRecord : List String
+                errorsAboutFilesThatAreAlreadyOnRecord =
+                    Set.intersect (Set.fromList fileNamesToCheckAgainst) fileNames
+                        |> Set.map (\fn -> "The file '" ++ fn ++ "' is a duplicate and won't be uploaded.")
+                        |> Set.toList
             in
             ( { model
                 | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
-                , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFileValues
+                , errors = List.concat [ model.errors, errorsAboutFilesThatArentImages, errorsAboutFilesThatAreAlreadyOnRecord ]
+                , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles
               }
-            , Cmd.batch commandsToUploadTheFiles
+            , Cmd.batch <|
+                List.append
+                    commandsToUploadTheFiles
+                    [ Process.sleep 3000 |> Task.perform (\_ -> DelistErrors) ]
             )
 
-        FileUploaded file response ->
-            --  This is where we record it in the database that the file has been uploaded
-            case response of
+        FileUploaded fileBeingUploaded result ->
+            --  Now update the list of files being uploaded
+            --  and record the details of the file in the database
+            case result of
                 Ok _ ->
-                    ( model
-                    , Cmd.batch
-                        [ request
-                            { method = "POST"
-                            , url = supabaseURL ++ "/rest/v1/reports"
-                            , headers =
-                                [ header "apiKey" supabaseAnonymousToken
-                                , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
-                                , header "Prefer" "return=representation" --  This can be "representation" or "minimal"; "representation" returns the row just inserted, and minimal returns absolutely nothing
-                                ]
-                            , body =
-                                Http.jsonBody
-                                    (Encode.object
-                                        [ ( "name", Encode.string file.name )
-                                        , ( "size", Encode.int file.size )
-                                        , ( "mime", Encode.string file.mime )
-                                        , ( "userId", Encode.string <| Maybe.withDefault "" model.currentUsersId )
-                                        , ( "uploadedOn", Encode.int <| Time.posixToMillis model.currentTime )
-                                        ]
-                                    )
-                            , expect = expectJson InsertedUploadedFilesDetails reportsDecoder
-                            , timeout = Nothing
-                            , tracker = Nothing
-                            }
-                        ]
+                    ( { model | filesBeingUploaded = List.filter (\fbu -> fbu.id /= fileBeingUploaded.id) model.filesBeingUploaded }
+                    , Task.perform (InsertUploadedFilesDetails fileBeingUploaded) Time.now
                     )
 
                 Err e ->
-                    ( Debug.log (Debug.toString e) model, Cmd.none )
+                    ( { model
+                        | filesBeingUploaded = updateFileBeingUploadedsStatus model.filesBeingUploaded fileBeingUploaded.id <| ErrorWhileUploading <| getHttpErrorToDisplay e
+                        , errors = getHttpErrorToDisplay e :: model.errors
+                      }
+                    , Cmd.none
+                    )
+
+        InsertUploadedFilesDetails fileBeingUploaded timestamp ->
+            ( model
+            , request
+                { method = "POST"
+                , url = supabaseURL ++ "/rest/v1/reports"
+                , headers =
+                    [ header "apiKey" supabaseAnonymousToken
+                    , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                    , header "Prefer" "return=representation" --  This can be "representation" or "minimal"; "representation" returns the row just inserted, and minimal returns absolutely nothing
+                    ]
+                , body =
+                    Http.jsonBody
+                        (Encode.object
+                            [ ( "name", Encode.string <| File.name fileBeingUploaded.file )
+                            , ( "size", Encode.int <| File.size fileBeingUploaded.file )
+                            , ( "mime", Encode.string <| File.mime fileBeingUploaded.file )
+                            , ( "userId", Encode.string <| Maybe.withDefault "" model.currentUsersId )
+                            , ( "uploadedOn", Encode.int <| Time.posixToMillis timestamp )
+                            ]
+                        )
+                , expect = expectJson InsertedUploadedFilesDetails reportsDecoder
+                , timeout = Nothing
+                , tracker = Nothing
+                }
+            )
 
         InsertedUploadedFilesDetails result ->
             case result of
@@ -401,8 +516,66 @@ update msg model =
                 Err e ->
                     ( Debug.log (Debug.toString e) model, Cmd.none )
 
+        DelistErrors ->
+            ( { model | errors = [] }, Cmd.none )
+
         NoOp ->
             ( model, Cmd.none )
+
+
+updateFileBeingUploadedsStatus : List FileBeingUploaded -> Int -> UploadStatus -> List FileBeingUploaded
+updateFileBeingUploadedsStatus filesBeingUploaded id uploadStatus =
+    List.map
+        (\fbu ->
+            if fbu.id == id then
+                { fbu | uploadStatus = uploadStatus }
+
+            else
+                fbu
+        )
+        filesBeingUploaded
+
+
+getHttpErrorToDisplay : Http.Error -> String
+getHttpErrorToDisplay err =
+    case err of
+        Http.BadUrl s ->
+            "An error occurred that shouldn't have. Please try again. Additional information: " ++ s
+
+        Http.Timeout ->
+            "The task couldn't be accomplished in time. Please try again."
+
+        Http.NetworkError ->
+            "You seem to be offline. Please connect back and try again."
+
+        Http.BadStatus code ->
+            "A problem occurred. Please try again or report this error. Additional information: Status code " ++ String.fromInt code
+
+        Http.BadBody explanation ->
+            "An unexpected problem occurred. Please try again or report this error. Additional information: " ++ explanation
+
+
+makeDeleteReportRequest : String -> ReportId -> Cmd Msg
+makeDeleteReportRequest supabaseAuthorisedToken reportId =
+    request
+        { method = "DELETE"
+        , headers =
+            [ header "apiKey" supabaseAnonymousToken
+            , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
+
+            -- , header "returning" "minimal"
+            ]
+        , url = supabaseURL ++ "/rest/v1/reports?id=eq." ++ String.fromInt reportId
+        , body = Http.emptyBody
+        , expect = expectWhatever (ReportDeleted reportId)
+        , timeout = Nothing
+        , tracker = Nothing
+        }
+
+
+itIsAnImage : File -> Bool
+itIsAnImage =
+    \file -> List.member (File.mime file) [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ]
 
 
 checkIfCharactersAreAWSSafe : String -> Bool
@@ -415,23 +588,18 @@ checkIfCharactersAreAWSSafe s =
 
 makeFileUploadRequest : String -> String -> FileBeingUploaded -> Cmd Msg
 makeFileUploadRequest supabaseAuthorisedToken userId fileBeingUploaded =
-    case decodeValue File.decoder fileBeingUploaded.value of
-        Ok file ->
-            request
-                { method = "POST"
-                , url = supabaseURL ++ "/storage/v1/object/reports/" ++ userId ++ "/" ++ File.name file
-                , headers =
-                    [ header "apiKey" supabaseAnonymousToken
-                    , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
-                    ]
-                , body = fileBody file
-                , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
-                , timeout = Nothing
-                , tracker = Nothing
-                }
-
-        Err _ ->
-            Cmd.none
+    request
+        { method = "POST"
+        , url = supabaseURL ++ "/storage/v1/object/reports/" ++ userId ++ "/" ++ File.name fileBeingUploaded.file
+        , headers =
+            [ header "apiKey" supabaseAnonymousToken
+            , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
+            ]
+        , body = fileBody fileBeingUploaded.file
+        , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
+        , timeout = Nothing
+        , tracker = Nothing
+        }
 
 
 fileUploadedResponseDecoder : Decoder FileUploadedResponse
@@ -557,7 +725,7 @@ reportDecoder =
         (field "name" string)
         (field "size" int)
         (field "mime" string)
-        (field "uploadedOn" int |> Decode.map millisToPosix)
+        (field "uploadedOn" int |> Decode.map Time.millisToPosix)
 
 
 
@@ -566,7 +734,7 @@ reportDecoder =
 
 subscriptions : Model -> Sub Msg
 subscriptions _ =
-    Sub.batch [ Time.every 1000 GotTheTime ]
+    Sub.batch []
 
 
 
@@ -673,23 +841,74 @@ home model =
         --  Show the user their files
         let
             sortedFiles =
-                List.sortWith (comparePosix model.currentTimezone) model.reports
+                List.sortWith comparePosix model.reports
                     |> List.reverse
         in
-        [ div
-            [ class "w-full pb-8 px-8 grid grid-cols-1 gap-4 justify-start content-start card"
-            ]
-            [ div
-                [ class "card-body" ]
-                [ div
-                    [ class "card-actions justify-between" ]
-                    [ div [] [ text model.email ]
-                    , button [ class "btn btn-ghost", onClick LogOutClicked ] [ text "Log out" ]
+        List.concat
+            [ [ div
+                    [ class "w-full pb-8 px-8 grid grid-cols-1 gap-4 justify-start content-start card"
                     ]
-                , reportsDisplay sortedFiles model.currentTimezone
+                    [ div
+                        [ class "card-body" ]
+                        [ div
+                            [ class "card-actions justify-between" ]
+                            [ div [] [ text model.email ]
+                            , button [ class "btn btn-ghost", onClick LogOutClicked ] [ text "Log out" ]
+                            ]
+                        , reportsDisplay sortedFiles model.currentTimezone model.selectedReportIds
+                        ]
+                    ]
+              ]
+            , if List.length model.errors > 0 then
+                [ errorsDisplay model.errors ]
+
+              else
+                []
+            , if model.showDeleteReportsConfirmation then
+                [ deleteReportsConfirmation model.reports model.selectedReportIds ]
+
+              else
+                []
+            ]
+
+
+deleteReportsConfirmation : List Report -> List ReportId -> Html Msg
+deleteReportsConfirmation reports selectedReportIds =
+    let
+        selectedReportsFileNames =
+            List.filter (\r -> List.member r.id selectedReportIds) reports
+                |> List.sortBy .id
+                |> List.reverse
+                |> List.map .name
+    in
+    div
+        [ class "modal modal-open" ]
+        [ div
+            [ class "modal-box" ]
+            [ h3 [ class "text-lg font-bold" ] [ text "Confirm Deletion" ]
+            , p [] [ text "Please confirm that you want to delete the following reports:" ]
+            , div [ class "max-h-20" ] [ ol [] (List.map (\n -> li [] [ text n ]) selectedReportsFileNames) ]
+            , p [] [ text "This action cannot be undone." ]
+            , div
+                [ class "modal-action" ]
+                [ button [ class "btn", onClick DeleteReportsConfirmationCloseClicked ] [ text "Close" ]
+                , button [ class "btn btn-primary", onClick DeleteReportsConfirmationDeleteClicked ] [ text "Delete" ]
                 ]
             ]
         ]
+
+
+errorsDisplay : Errors -> Html Msg
+errorsDisplay errors =
+    div
+        [ class "fixed bottom-0 left-0 p-2 grid grid-cols-1 auto-rows-auto gap-1"
+        ]
+        (List.map errorDisplay errors)
+
+
+errorDisplay : String -> Html Msg
+errorDisplay error =
+    div [ class "alert alert-error shadow-lg transition-opacity" ] [ text error ]
 
 
 getUploadStatus : FileBeingUploaded -> String
@@ -705,8 +924,8 @@ getUploadStatus fileToProcess =
             "Problem uploading"
 
 
-reportsDisplay : List Report -> Zone -> Html Msg
-reportsDisplay reports zone =
+reportsDisplay : List Report -> Zone -> List ReportId -> Html Msg
+reportsDisplay reports zone selectedReportIds =
     div
         [ cardClasses
         , onFilesDrop FilesDropped
@@ -717,22 +936,32 @@ reportsDisplay reports zone =
             [ div [ class "card-title" ] [ text "Your reports" ]
             , div
                 [ class "grid w-full" ]
-                (List.indexedMap (reportDisplay zone) reports)
+                (List.indexedMap (reportDisplay zone selectedReportIds) reports)
             , div
                 [ class "card-actions justify-end" ]
-                [ button [ class "btn", onClick UploadClicked ] [ text "Upload" ] ]
+                [ button [ class "btn", disabled (List.length selectedReportIds == 0), onClick DeleteClicked ] [ text "Delete" ]
+                , button [ class "btn", onClick UploadClicked ] [ text "Upload" ]
+                ]
             ]
         ]
 
 
-reportDisplay : Zone -> Int -> Report -> Html Msg
-reportDisplay zone index report =
+reportDisplay : Zone -> List ReportId -> Int -> Report -> Html Msg
+reportDisplay zone selectedReportIds index report =
     div
         [ class "reportDisplay"
-        , class "w-full grid gap-4"
+        , class "w-full grid gap-4 rounded-md p-4 active:bg-slate-300"
+        , class "hover:bg-slate-100"
+        , classList [ ( "bg-slate-200", List.member report.id selectedReportIds ) ]
+        , onClick (ToggleSelection report.id)
         ]
         [ div [ class "text-right" ] [ index + 1 |> String.fromInt |> text ]
-        , div [ class "overflow-hidden" ] [ getDisplayDate zone report.uploadedOn |> text ]
+        , div
+            [ class "overflow-hidden" ]
+            [ report.uploadedOn
+                |> getDisplayDate zone
+                |> text
+            ]
         , div [ class "overflow-hidden" ] [ text report.name ]
         ]
 
@@ -741,9 +970,9 @@ reportDisplay zone index report =
 -- HELPER FUNCTIONS
 
 
-comparePosix : Zone -> Report -> Report -> Order
-comparePosix zone a b =
-    compare (Time.toMillis zone a.uploadedOn) (Time.toMillis zone b.uploadedOn)
+comparePosix : Report -> Report -> Order
+comparePosix a b =
+    compare (Time.posixToMillis a.uploadedOn) (Time.posixToMillis b.uploadedOn)
 
 
 cardClasses : Attribute msg
@@ -780,14 +1009,14 @@ onDrop msg =
     preventDefaultOn "drop" (Decode.succeed ( msg, True ))
 
 
-onFilesDrop : (List Value -> Msg) -> Attribute Msg
+onFilesDrop : (List File -> Msg) -> Attribute Msg
 onFilesDrop msg =
     preventDefaultOn "drop" (Decode.map2 Tuple.pair (Decode.map msg filesDecoder) (Decode.succeed True))
 
 
-filesDecoder : Decoder (List Value)
+filesDecoder : Decoder (List File)
 filesDecoder =
-    Decode.at [ "dataTransfer", "files" ] (Decode.list Decode.value)
+    Decode.at [ "dataTransfer", "files" ] (Decode.list File.decoder)
 
 
 onDragEnd : Msg -> Attribute Msg
