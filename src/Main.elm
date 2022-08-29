@@ -4,7 +4,7 @@ import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
 import File exposing (File)
 import File.Select
-import Html exposing (Attribute, Html, a, button, div, h1, h2, h3, input, li, ol, p, text)
+import Html exposing (Attribute, Html, a, button, div, h1, h2, h3, input, li, ol, p, progress, span, text)
 import Html.Attributes exposing (class, classList, disabled, href, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
 import Http exposing (emptyBody, expectJson, expectWhatever, fileBody, header, request)
@@ -69,8 +69,9 @@ type alias Model =
     , errors : Errors
 
     -- Files being uploaded
+    , showUploadFiles : Bool
     , lastUsedIndexNumberForFilesBeingUploaded : Int
-    , filesBeingUploaded : FilesBeingUploaded
+    , filesBeingUploaded : List FileBeingUploaded
     }
 
 
@@ -98,12 +99,6 @@ urlToPage url =
         |> Maybe.withDefault NotFound
 
 
-type alias SessionDetails =
-    { token : String
-    , userId : String
-    }
-
-
 type alias Errors =
     List String
 
@@ -116,13 +111,9 @@ type alias FileBeingUploaded =
 
 
 type UploadStatus
-    = Uploading Float
+    = Uploading Int Int
     | Uploaded
     | ErrorWhileUploading String
-
-
-type alias FilesBeingUploaded =
-    List FileBeingUploaded
 
 
 type alias FileUploadedResponse =
@@ -162,6 +153,7 @@ init _ url key =
       , showDeleteReportsConfirmation = False
       , reports = []
       , errors = []
+      , showUploadFiles = False
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
       }
@@ -188,7 +180,9 @@ type Msg
     | GoToLoginPageClicked
     | LogOutClicked
     | UploadClicked
+    | UploadFilesChooseFilesClicked
     | FilesSelected File (List File)
+    | UploadFilesCloseClicked
     | ToggleSelection ReportId
     | DeleteClicked
     | DeleteReportsConfirmationDeleteClicked
@@ -196,6 +190,7 @@ type Msg
     | ReportDeleted ReportId (Result Http.Error ())
       --  File upload messages
     | FilesDropped (List File)
+    | GotUploadProgress Int Http.Progress
     | FileUploaded FileBeingUploaded (Result Http.Error FileUploadedResponse)
     | InsertUploadedFilesDetails FileBeingUploaded Posix
     | InsertedUploadedFilesDetails (Result Http.Error (List Report))
@@ -294,10 +289,16 @@ update msg model =
             ( { model | currentPage = Top }, Navigation.pushUrl model.key "/" )
 
         UploadClicked ->
+            ( { model | showUploadFiles = True }, Cmd.none )
+
+        UploadFilesChooseFilesClicked ->
             ( model, File.Select.files [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] FilesSelected )
 
         FilesSelected file files ->
             ( model, Cmd.none )
+
+        UploadFilesCloseClicked ->
+            ( { model | showUploadFiles = False }, Cmd.none )
 
         ToggleSelection reportId ->
             let
@@ -404,13 +405,13 @@ update msg model =
                 idsToUse =
                     List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles)
 
-                newFilesBeingUploaded : FilesBeingUploaded
+                newFilesBeingUploaded : List FileBeingUploaded
                 newFilesBeingUploaded =
                     List.map2
                         (\id file ->
                             { id = id
                             , file = file
-                            , uploadStatus = Uploading 0
+                            , uploadStatus = Uploading 0 1
                             }
                         )
                         idsToUse
@@ -457,12 +458,42 @@ update msg model =
                     [ Process.sleep 3000 |> Task.perform (\_ -> DelistErrors) ]
             )
 
+        GotUploadProgress fileBeingUploadedId progress ->
+            let
+                newFilesBeingUploaded =
+                    List.map
+                        (\fbu ->
+                            case ( fbu.id == fileBeingUploadedId, progress ) of
+                                ( True, Http.Sending values ) ->
+                                    { fbu | uploadStatus = Uploading values.sent values.size }
+
+                                _ ->
+                                    fbu
+                        )
+                        model.filesBeingUploaded
+            in
+            ( { model | filesBeingUploaded = newFilesBeingUploaded }, Cmd.none )
+
         FileUploaded fileBeingUploaded result ->
             --  Now update the list of files being uploaded
             --  and record the details of the file in the database
             case result of
                 Ok _ ->
-                    ( { model | filesBeingUploaded = List.filter (\fbu -> fbu.id /= fileBeingUploaded.id) model.filesBeingUploaded }
+                    let
+                        newFilesBeingUploaded =
+                            List.filter (\fbu -> fbu.id /= fileBeingUploaded.id) model.filesBeingUploaded
+                    in
+                    ( { model
+                        | filesBeingUploaded = newFilesBeingUploaded
+                        , showUploadFiles =
+                            --  Only close the window if it is open and all uploads are finished
+                            --  Don't open it if it is closed
+                            if model.showUploadFiles then
+                                List.length newFilesBeingUploaded > 0
+
+                            else
+                                False
+                      }
                     , Task.perform (InsertUploadedFilesDetails fileBeingUploaded) Time.now
                     )
 
@@ -598,7 +629,7 @@ makeFileUploadRequest supabaseAuthorisedToken userId fileBeingUploaded =
         , body = fileBody fileBeingUploaded.file
         , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
         , timeout = Nothing
-        , tracker = Nothing
+        , tracker = Just <| String.fromInt fileBeingUploaded.id
         }
 
 
@@ -607,7 +638,7 @@ fileUploadedResponseDecoder =
     Decode.map FileUploadedResponse (field "Key" string)
 
 
-updateFilesBeingUploaded : FilesBeingUploaded -> Int -> (FileBeingUploaded -> FileBeingUploaded) -> FilesBeingUploaded
+updateFilesBeingUploaded : List FileBeingUploaded -> Int -> (FileBeingUploaded -> FileBeingUploaded) -> List FileBeingUploaded
 updateFilesBeingUploaded filesBeingUploaded id updateFunction =
     List.map
         (\fileBeingUploaded ->
@@ -733,8 +764,15 @@ reportDecoder =
 
 
 subscriptions : Model -> Sub Msg
-subscriptions _ =
-    Sub.batch []
+subscriptions model =
+    case model.currentPage of
+        Home ->
+            model.filesBeingUploaded
+                |> List.map (\fbu -> Http.track (String.fromInt fbu.id) (GotUploadProgress fbu.id))
+                |> Sub.batch
+
+        _ ->
+            Sub.none
 
 
 
@@ -869,7 +907,93 @@ home model =
 
               else
                 []
+            , if model.showUploadFiles then
+                [ uploadFiles model.filesBeingUploaded ]
+
+              else
+                []
             ]
+
+
+uploadFiles : List FileBeingUploaded -> Html Msg
+uploadFiles filesBeingUploaded =
+    div
+        [ class "modal modal-open" ]
+        [ div
+            [ class "modal-box" ]
+            [ h3 [ class "text-lg font-bold" ] [ text "Upload Files" ]
+            , div
+                [ class "overflow-y-auto" ]
+                [ case filesBeingUploaded of
+                    [] ->
+                        div
+                            [ class "w-full p-8 rounded-md bg-slate-100 grid justify-items-center"
+                            , onFilesDrop FilesDropped
+                            , onDragOver NoOp
+                            ]
+                            [ span [ class "text-slate-400 text-center" ] [ text "Drop files here or click the button below to choose files" ]
+                            ]
+
+                    _ ->
+                        div
+                            [ class "filesBeingUploaded"
+                            , class "w-full h-full grid"
+                            ]
+                            (List.map fileBeingUploadedDisplay filesBeingUploaded)
+                ]
+            , div
+                [ class "modal-action" ]
+                [ button [ class "btn", onClick UploadFilesCloseClicked ] [ text "Close" ]
+                , button [ class "btn btn-primary", onClick UploadFilesChooseFilesClicked ] [ text "Choose files" ]
+                ]
+            ]
+        ]
+
+
+fileBeingUploadedDisplay : FileBeingUploaded -> Html msg
+fileBeingUploadedDisplay fileBeingUploaded =
+    div
+        [ class "fileBeingUploaded"
+        , class "w-full p-4 grid gap-x-4 rows-1 items-center text-sm"
+        ]
+        [ span [ class "overflow-y-auto" ] [ text <| File.name fileBeingUploaded.file ]
+        , span
+            [ class "overflow-y-auto" ]
+            [ text <| getDisplayFileSize fileBeingUploaded.file ]
+        , case fileBeingUploaded.uploadStatus of
+            Uploading sent size ->
+                progress [ class "progress w-full", value <| String.fromInt sent, Html.Attributes.max <| String.fromInt size ] []
+
+            Uploaded ->
+                progress [ class "progress w-full", value "1", Html.Attributes.max "1" ] []
+
+            ErrorWhileUploading error ->
+                span [] [ text error ]
+        ]
+
+
+getDisplayFileSize : File -> String
+getDisplayFileSize file =
+    let
+        fileSize =
+            File.size file
+                |> Basics.toFloat
+    in
+    [ ( 1000 ^ 0, "B" ), ( 1000 ^ 1, "kB" ), ( 1000 ^ 2, "MB" ), ( 1000 ^ 3, "GB" ), ( 1000 ^ 4, "TB" ), ( 1000 ^ 5, "PB" ) ]
+        |> List.map (\( divisor, unit ) -> ( fileSize / Basics.toFloat divisor, unit ))
+        |> List.filter (\( value, _ ) -> value >= 1 && value <= 1000)
+        |> List.head
+        |> (\maybeHead ->
+                case maybeHead of
+                    Just ( value, unit ) ->
+                        value
+                            |> Basics.round
+                            |> String.fromInt
+                            |> (\x -> x ++ unit)
+
+                    Nothing ->
+                        ""
+           )
 
 
 deleteReportsConfirmation : List Report -> List ReportId -> Html Msg
@@ -884,11 +1008,12 @@ deleteReportsConfirmation reports selectedReportIds =
     div
         [ class "modal modal-open" ]
         [ div
-            [ class "modal-box" ]
-            [ h3 [ class "text-lg font-bold" ] [ text "Confirm Deletion" ]
-            , p [] [ text "Please confirm that you want to delete the following reports:" ]
-            , div [ class "max-h-20" ] [ ol [] (List.map (\n -> li [] [ text n ]) selectedReportsFileNames) ]
-            , p [] [ text "This action cannot be undone." ]
+            [ class "modal-box max-h-full" ]
+            [ h3 [ class "text-lg font-bold pb-4" ] [ text "Confirm deletion" ]
+            , p [ class "pb-4" ] [ text "Please confirm that you want to delete the following reports. This action cannot be undone." ]
+            , div
+                [ class "max-h-full overflow-y-auto w-full bg-slate-100 rounded-md p-8" ]
+                [ ol [] (List.map (\n -> li [ class "pb-2" ] [ text n ]) selectedReportsFileNames) ]
             , div
                 [ class "modal-action" ]
                 [ button [ class "btn", onClick DeleteReportsConfirmationCloseClicked ] [ text "Close" ]
@@ -914,8 +1039,8 @@ errorDisplay error =
 getUploadStatus : FileBeingUploaded -> String
 getUploadStatus fileToProcess =
     case fileToProcess.uploadStatus of
-        Uploading progress ->
-            (round progress |> String.fromInt) ++ "% uploaded"
+        Uploading sent size ->
+            String.fromInt (sent // size) ++ "% uploaded"
 
         Uploaded ->
             "Uploaded"
@@ -928,8 +1053,6 @@ reportsDisplay : List Report -> Zone -> List ReportId -> Html Msg
 reportsDisplay reports zone selectedReportIds =
     div
         [ cardClasses
-        , onFilesDrop FilesDropped
-        , onDragOver NoOp
         ]
         [ div
             [ class "card-body" ]
@@ -940,7 +1063,7 @@ reportsDisplay reports zone selectedReportIds =
             , div
                 [ class "card-actions justify-end" ]
                 [ button [ class "btn", disabled (List.length selectedReportIds == 0), onClick DeleteClicked ] [ text "Delete" ]
-                , button [ class "btn", onClick UploadClicked ] [ text "Upload" ]
+                , button [ class "btn btn-primary", onClick UploadClicked ] [ text "Upload" ]
                 ]
             ]
         ]
@@ -962,7 +1085,7 @@ reportDisplay zone selectedReportIds index report =
                 |> getDisplayDate zone
                 |> text
             ]
-        , div [ class "overflow-hidden" ] [ text report.name ]
+        , div [ class "overflow-x-auto text-overflow-ellipsis" ] [ text report.name ]
         ]
 
 
