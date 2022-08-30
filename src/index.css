@@ -8,9 +8,19 @@ html, body {
   min-width: 100%;
   width: 100%;
 }
+@media (max-width: 640px) {
+  .reportDisplay {
+    /* grid-template-columns: minmax(0, 1rem) minmax(1rem, 8rem) 1fr; */
+    grid-template-columns: minmax(0, 1rem) minmax(1rem, 1fr);
+    grid-template-rows: min-content min-content;
+  }
+}
 
-.reportDisplay {
-  grid-template-columns: minmax(0, 1rem) minmax(1rem, 8rem) 1fr;
+@media (min-width: 640px) {
+  .reportDisplay {
+    grid-template-columns: minmax(0, 1rem) minmax(1rem, 8rem) 1fr;
+    grid-template-rows: 1fr;
+  }
 }
 
 .fileBeingUploaded {

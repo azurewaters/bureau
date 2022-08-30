@@ -2,12 +2,15 @@ module Main exposing (..)
 
 import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
+import Bytes exposing (Bytes)
+import Bytes.Decode
 import File exposing (File)
+import File.Download
 import File.Select
 import Html exposing (Attribute, Html, a, button, div, h1, h2, h3, input, li, ol, p, progress, span, text)
 import Html.Attributes exposing (class, classList, disabled, href, placeholder, required, type_, value)
 import Html.Events exposing (on, onClick, onInput, preventDefaultOn)
-import Http exposing (emptyBody, expectJson, expectWhatever, fileBody, header, request)
+import Http exposing (emptyBody, expectBytesResponse, expectJson, expectWhatever, fileBody, header, request)
 import Json.Decode as Decode exposing (Decoder, Error(..), field, int, string)
 import Json.Encode as Encode
 import Process
@@ -69,7 +72,6 @@ type alias Model =
     , errors : Errors
 
     -- Files being uploaded
-    , showUploadFiles : Bool
     , lastUsedIndexNumberForFilesBeingUploaded : Int
     , filesBeingUploaded : List FileBeingUploaded
     }
@@ -153,7 +155,6 @@ init _ url key =
       , showDeleteReportsConfirmation = False
       , reports = []
       , errors = []
-      , showUploadFiles = False
       , lastUsedIndexNumberForFilesBeingUploaded = 0
       , filesBeingUploaded = []
       }
@@ -179,8 +180,7 @@ type Msg
       -- Home messages
     | GoToLoginPageClicked
     | LogOutClicked
-    | UploadClicked
-    | UploadFilesChooseFilesClicked
+    | ChooseFilesClicked
     | FilesSelected File (List File)
     | UploadFilesCloseClicked
     | ToggleSelection ReportId
@@ -188,6 +188,8 @@ type Msg
     | DeleteReportsConfirmationDeleteClicked
     | DeleteReportsConfirmationCloseClicked
     | ReportDeleted ReportId (Result Http.Error ())
+    | DownloadClicked
+    | DownloadedFile ReportId (Result Http.Error Bytes)
       --  File upload messages
     | FilesDropped (List File)
     | GotUploadProgress Int Http.Progress
@@ -288,17 +290,18 @@ update msg model =
         DoNothing _ ->
             ( { model | currentPage = Top }, Navigation.pushUrl model.key "/" )
 
-        UploadClicked ->
-            ( { model | showUploadFiles = True }, Cmd.none )
-
-        UploadFilesChooseFilesClicked ->
+        ChooseFilesClicked ->
             ( model, File.Select.files [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] FilesSelected )
 
         FilesSelected file files ->
-            ( model, Cmd.none )
+            let
+                ( newModel, newCommands ) =
+                    uploadTheseFiles (file :: files) model
+            in
+            ( newModel, newCommands )
 
         UploadFilesCloseClicked ->
-            ( { model | showUploadFiles = False }, Cmd.none )
+            ( model, Cmd.none )
 
         ToggleSelection reportId ->
             let
@@ -365,98 +368,67 @@ update msg model =
                     , Cmd.none
                     )
 
+        DownloadClicked ->
+            --  This is where we start the process of downloading selected reports' files
+            --  Two step procedure:
+            --      Generate a pre-signed URL
+            --      Download that file with File.download
+            let
+                commands =
+                    case model.reports of
+                        [] ->
+                            Cmd.none
+
+                        _ ->
+                            model.reports
+                                |> List.filter (\r -> List.member r.id model.selectedReportIds)
+                                |> List.map
+                                    (\r ->
+                                        request
+                                            { method = "GET"
+                                            , headers =
+                                                [ Http.header "apikey" supabaseAnonymousToken
+                                                , Http.header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                                                ]
+                                            , url = supabaseURL ++ "/storage/v1/object/authenticated/reports/" ++ Maybe.withDefault "" model.currentUsersId ++ "/" ++ r.name
+                                            , body = Http.emptyBody
+                                            , expect = Http.expectBytesResponse (DownloadedFile r.id) (resolveResponse Ok)
+                                            , timeout = Nothing
+                                            , tracker = Nothing
+                                            }
+                                    )
+                                |> Cmd.batch
+            in
+            ( model, commands )
+
+        DownloadedFile reportId result ->
+            let
+                command =
+                    model.reports
+                        |> List.filter (\r -> r.id == reportId)
+                        |> List.head
+                        |> (\maybeReport ->
+                                case maybeReport of
+                                    Just report ->
+                                        case result of
+                                            Ok bytes ->
+                                                File.Download.bytes report.name report.mime bytes
+
+                                            Err err ->
+                                                Debug.log (Debug.toString err) Cmd.none
+
+                                    Nothing ->
+                                        Cmd.none
+                           )
+            in
+            ( model, command )
+
         FilesDropped files ->
             let
-                imageFiles : List File
-                imageFiles =
-                    List.filter itIsAnImage files
-
-                namesOfFilesAlreadyBeingUploaded : List String
-                namesOfFilesAlreadyBeingUploaded =
-                    model.filesBeingUploaded
-                        --  Files that had problems when last uploaded
-                        --  should be allowed to be uplodaded again
-                        |> List.filter
-                            (\fbu ->
-                                case fbu.uploadStatus of
-                                    ErrorWhileUploading _ ->
-                                        False
-
-                                    _ ->
-                                        True
-                            )
-                        |> List.map (\fbu -> File.name fbu.file)
-
-                namesOfReportsFiles : List String
-                namesOfReportsFiles =
-                    List.map .name model.reports
-
-                fileNamesToCheckAgainst : List String
-                fileNamesToCheckAgainst =
-                    List.concat [ namesOfFilesAlreadyBeingUploaded, namesOfReportsFiles ]
-
-                uniqueImageFiles : List File
-                uniqueImageFiles =
-                    List.filter
-                        (\file -> not <| List.member (File.name file) fileNamesToCheckAgainst)
-                        imageFiles
-
-                idsToUse : List Int
-                idsToUse =
-                    List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles)
-
-                newFilesBeingUploaded : List FileBeingUploaded
-                newFilesBeingUploaded =
-                    List.map2
-                        (\id file ->
-                            { id = id
-                            , file = file
-                            , uploadStatus = Uploading 0 1
-                            }
-                        )
-                        idsToUse
-                        uniqueImageFiles
-
-                commandsToUploadTheFiles : List (Cmd Msg)
-                commandsToUploadTheFiles =
-                    List.map
-                        (makeFileUploadRequest model.supabaseAuthorisedToken (Maybe.withDefault "" model.currentUsersId))
-                        newFilesBeingUploaded
-
-                -- Now find the errors
-                --  First, the files that aren't images
-                --  Second, the files that are already being uploaded
-                fileNames : Set String
-                fileNames =
-                    List.map File.name files
-                        |> Set.fromList
-
-                errorsAboutFilesThatArentImages : List String
-                errorsAboutFilesThatArentImages =
-                    let
-                        imageFileNames =
-                            Set.fromList <| List.map File.name imageFiles
-                    in
-                    Set.diff fileNames imageFileNames
-                        |> Set.map (\fn -> "The file '" ++ fn ++ "' is not an image and won't be uploaded.")
-                        |> Set.toList
-
-                errorsAboutFilesThatAreAlreadyOnRecord : List String
-                errorsAboutFilesThatAreAlreadyOnRecord =
-                    Set.intersect (Set.fromList fileNamesToCheckAgainst) fileNames
-                        |> Set.map (\fn -> "The file '" ++ fn ++ "' is a duplicate and won't be uploaded.")
-                        |> Set.toList
+                ( newModel, newCommands ) =
+                    uploadTheseFiles files model
             in
-            ( { model
-                | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
-                , errors = List.concat [ model.errors, errorsAboutFilesThatArentImages, errorsAboutFilesThatAreAlreadyOnRecord ]
-                , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles
-              }
-            , Cmd.batch <|
-                List.append
-                    commandsToUploadTheFiles
-                    [ Process.sleep 3000 |> Task.perform (\_ -> DelistErrors) ]
-            )
+            ( newModel, newCommands )
 
         GotUploadProgress fileBeingUploadedId progress ->
             let
@@ -483,17 +455,7 @@ update msg model =
                         newFilesBeingUploaded =
                             List.filter (\fbu -> fbu.id /= fileBeingUploaded.id) model.filesBeingUploaded
                     in
-                    ( { model
-                        | filesBeingUploaded = newFilesBeingUploaded
-                        , showUploadFiles =
-                            --  Only close the window if it is open and all uploads are finished
-                            --  Don't open it if it is closed
-                            if model.showUploadFiles then
-                                List.length newFilesBeingUploaded > 0
-
-                            else
-                                False
-                      }
+                    ( { model | filesBeingUploaded = newFilesBeingUploaded }
                     , Task.perform (InsertUploadedFilesDetails fileBeingUploaded) Time.now
                     )
 
@@ -552,6 +514,120 @@ update msg model =
 
         NoOp ->
             ( model, Cmd.none )
+
+
+resolveResponse : (body -> Result String a) -> Http.Response body -> Result Http.Error a
+resolveResponse toResult response =
+    case response of
+        Http.BadUrl_ url_ ->
+            Err (Http.BadUrl url_)
+
+        Http.Timeout_ ->
+            Err Http.Timeout
+
+        Http.NetworkError_ ->
+            Err Http.NetworkError
+
+        Http.BadStatus_ metadata _ ->
+            Err (Http.BadStatus metadata.statusCode)
+
+        Http.GoodStatus_ _ body ->
+            Result.mapError Http.BadBody (toResult body)
+
+
+uploadTheseFiles : List File -> Model -> ( Model, Cmd Msg )
+uploadTheseFiles files model =
+    let
+        imageFiles : List File
+        imageFiles =
+            List.filter itIsAnImage files
+
+        namesOfFilesAlreadyBeingUploaded : List String
+        namesOfFilesAlreadyBeingUploaded =
+            model.filesBeingUploaded
+                --  Files that had problems when last uploaded
+                --  should be allowed to be uplodaded again
+                |> List.filter
+                    (\fbu ->
+                        case fbu.uploadStatus of
+                            ErrorWhileUploading _ ->
+                                False
+
+                            _ ->
+                                True
+                    )
+                |> List.map (\fbu -> File.name fbu.file)
+
+        namesOfReportsFiles : List String
+        namesOfReportsFiles =
+            List.map .name model.reports
+
+        fileNamesToCheckAgainst : List String
+        fileNamesToCheckAgainst =
+            List.concat [ namesOfFilesAlreadyBeingUploaded, namesOfReportsFiles ]
+
+        uniqueImageFiles : List File
+        uniqueImageFiles =
+            List.filter
+                (\file -> not <| List.member (File.name file) fileNamesToCheckAgainst)
+                imageFiles
+
+        idsToUse : List Int
+        idsToUse =
+            List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles)
+
+        newFilesBeingUploaded : List FileBeingUploaded
+        newFilesBeingUploaded =
+            List.map2
+                (\id file ->
+                    { id = id
+                    , file = file
+                    , uploadStatus = Uploading 0 1
+                    }
+                )
+                idsToUse
+                uniqueImageFiles
+
+        commandsToUploadTheFiles : List (Cmd Msg)
+        commandsToUploadTheFiles =
+            List.map
+                (makeFileUploadRequest model.supabaseAuthorisedToken (Maybe.withDefault "" model.currentUsersId))
+                newFilesBeingUploaded
+
+        -- Now find the errors
+        --  First, the files that aren't images
+        --  Second, the files that are already being uploaded
+        fileNames : Set String
+        fileNames =
+            List.map File.name files
+                |> Set.fromList
+
+        errorsAboutFilesThatArentImages : List String
+        errorsAboutFilesThatArentImages =
+            let
+                imageFileNames =
+                    Set.fromList <| List.map File.name imageFiles
+            in
+            Set.diff fileNames imageFileNames
+                |> Set.map (\fn -> "The file '" ++ fn ++ "' is not an image and won't be uploaded.")
+                |> Set.toList
+
+        errorsAboutFilesThatAreAlreadyOnRecord : List String
+        errorsAboutFilesThatAreAlreadyOnRecord =
+            Set.intersect (Set.fromList fileNamesToCheckAgainst) fileNames
+                |> Set.map (\fn -> "The file '" ++ fn ++ "' is a duplicate and won't be uploaded.")
+                |> Set.toList
+    in
+    ( { model
+        | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
+        , errors = List.concat [ model.errors, errorsAboutFilesThatArentImages, errorsAboutFilesThatAreAlreadyOnRecord ]
+        , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles
+      }
+    , Cmd.batch <|
+        List.append
+            commandsToUploadTheFiles
+            [ Process.sleep 3000 |> Task.perform (\_ -> DelistErrors) ]
+    )
 
 
 updateFileBeingUploadedsStatus : List FileBeingUploaded -> Int -> UploadStatus -> List FileBeingUploaded
@@ -877,11 +953,6 @@ home model =
 
     else
         --  Show the user their files
-        let
-            sortedFiles =
-                List.sortWith comparePosix model.reports
-                    |> List.reverse
-        in
         List.concat
             [ [ div
                     [ class "w-full pb-8 px-8 grid grid-cols-1 gap-4 justify-start content-start card"
@@ -889,11 +960,11 @@ home model =
                     [ div
                         [ class "card-body" ]
                         [ div
-                            [ class "card-actions justify-between" ]
+                            [ class "card-actions justify-between items-center" ]
                             [ div [] [ text model.email ]
                             , button [ class "btn btn-ghost", onClick LogOutClicked ] [ text "Log out" ]
                             ]
-                        , reportsDisplay sortedFiles model.currentTimezone model.selectedReportIds
+                        , reportsDisplay model.filesBeingUploaded model.reports model.currentTimezone model.selectedReportIds
                         ]
                     ]
               ]
@@ -907,47 +978,7 @@ home model =
 
               else
                 []
-            , if model.showUploadFiles then
-                [ uploadFiles model.filesBeingUploaded ]
-
-              else
-                []
             ]
-
-
-uploadFiles : List FileBeingUploaded -> Html Msg
-uploadFiles filesBeingUploaded =
-    div
-        [ class "modal modal-open" ]
-        [ div
-            [ class "modal-box" ]
-            [ h3 [ class "text-lg font-bold" ] [ text "Upload Files" ]
-            , div
-                [ class "overflow-y-auto" ]
-                [ case filesBeingUploaded of
-                    [] ->
-                        div
-                            [ class "w-full p-8 rounded-md bg-slate-100 grid justify-items-center"
-                            , onFilesDrop FilesDropped
-                            , onDragOver NoOp
-                            ]
-                            [ span [ class "text-slate-400 text-center" ] [ text "Drop files here or click the button below to choose files" ]
-                            ]
-
-                    _ ->
-                        div
-                            [ class "filesBeingUploaded"
-                            , class "w-full h-full grid"
-                            ]
-                            (List.map fileBeingUploadedDisplay filesBeingUploaded)
-                ]
-            , div
-                [ class "modal-action" ]
-                [ button [ class "btn", onClick UploadFilesCloseClicked ] [ text "Close" ]
-                , button [ class "btn btn-primary", onClick UploadFilesChooseFilesClicked ] [ text "Choose files" ]
-                ]
-            ]
-        ]
 
 
 fileBeingUploadedDisplay : FileBeingUploaded -> Html msg
@@ -1049,8 +1080,14 @@ getUploadStatus fileToProcess =
             "Problem uploading"
 
 
-reportsDisplay : List Report -> Zone -> List ReportId -> Html Msg
-reportsDisplay reports zone selectedReportIds =
+reportsDisplay : List FileBeingUploaded -> List Report -> Zone -> List ReportId -> Html Msg
+reportsDisplay filesBeingUploaded reports zone selectedReportIds =
+    let
+        sortedReports =
+            reports
+                |> List.sortWith comparePosix
+                |> List.reverse
+    in
     div
         [ cardClasses
         ]
@@ -1058,14 +1095,64 @@ reportsDisplay reports zone selectedReportIds =
             [ class "card-body" ]
             [ div [ class "card-title" ] [ text "Your reports" ]
             , div
+                [ class "rounded-md bg-slate-100 border border-slate-300 p-4 grid grid-cols-1 auto-rows-min" ]
+                (List.concat
+                    [ [ dropZone ]
+                    , case filesBeingUploaded of
+                        [] ->
+                            []
+
+                        _ ->
+                            let
+                                values : List ( Int, Int )
+                                values =
+                                    List.map
+                                        (\fbu ->
+                                            case fbu.uploadStatus of
+                                                Uploading sent size ->
+                                                    ( sent, size )
+
+                                                _ ->
+                                                    ( 0, 0 )
+                                        )
+                                        filesBeingUploaded
+
+                                totalSent =
+                                    List.foldl (\( sent, _ ) total -> total + sent) 0 values
+
+                                totalSize =
+                                    List.foldl (\( _, size ) total -> total + size) 0 values
+                            in
+                            [ progress
+                                [ class "progress w-full"
+                                , Html.Attributes.value <| String.fromInt totalSent
+                                , Html.Attributes.max <| String.fromInt totalSize
+                                ]
+                                []
+                            ]
+                    ]
+                )
+            , div
                 [ class "grid w-full" ]
-                (List.indexedMap (reportDisplay zone selectedReportIds) reports)
+                (List.indexedMap (reportDisplay zone selectedReportIds) sortedReports)
             , div
                 [ class "card-actions justify-end" ]
                 [ button [ class "btn", disabled (List.length selectedReportIds == 0), onClick DeleteClicked ] [ text "Delete" ]
-                , button [ class "btn btn-primary", onClick UploadClicked ] [ text "Upload" ]
+                , button [ class "btn", disabled (List.length selectedReportIds == 0), onClick DownloadClicked ] [ text "Download" ]
                 ]
             ]
+        ]
+
+
+dropZone : Html Msg
+dropZone =
+    div
+        [ class "w-full md:p-4 grid justify-items-center"
+        , onFilesDrop FilesDropped
+        , onDragOver NoOp
+        ]
+        [ span [ class "text-slate-400 text-center hidden md:block" ] [ text "Drop files here or click the button" ]
+        , button [ class "btn btn-ghost", onClick ChooseFilesClicked ] [ text "Choose files" ]
         ]
 
 
@@ -1073,7 +1160,7 @@ reportDisplay : Zone -> List ReportId -> Int -> Report -> Html Msg
 reportDisplay zone selectedReportIds index report =
     div
         [ class "reportDisplay"
-        , class "w-full grid gap-4 rounded-md p-4 active:bg-slate-300"
+        , class "grid gap-4 rounded-md p-4 active:bg-slate-300"
         , class "hover:bg-slate-100"
         , classList [ ( "bg-slate-200", List.member report.id selectedReportIds ) ]
         , onClick (ToggleSelection report.id)
@@ -1085,7 +1172,7 @@ reportDisplay zone selectedReportIds index report =
                 |> getDisplayDate zone
                 |> text
             ]
-        , div [ class "overflow-x-auto text-overflow-ellipsis" ] [ text report.name ]
+        , div [ class "col-start-2 sm:col-start-3 overflow-x-auto text-overflow-ellipsis" ] [ text report.name ]
         ]
 
 
