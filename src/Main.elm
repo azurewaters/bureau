@@ -3,7 +3,6 @@ module Main exposing (..)
 import Browser exposing (Document, UrlRequest)
 import Browser.Navigation as Navigation exposing (Key)
 import Bytes exposing (Bytes)
-import Bytes.Decode
 import File exposing (File)
 import File.Download
 import File.Select
@@ -14,7 +13,7 @@ import Http exposing (emptyBody, expectBytesResponse, expectJson, expectWhatever
 import Json.Decode as Decode exposing (Decoder, Error(..), field, int, string)
 import Json.Encode as Encode
 import Process
-import Set exposing (Set)
+import Set
 import Task
 import Time exposing (Posix, Zone)
 import Url exposing (Protocol(..), Url)
@@ -59,9 +58,8 @@ type alias Model =
     -- Login and Sign up stuff
     , email : String
     , password : String
-    , loginErrors : Errors
-    , signUpErrors : Errors
     , currentUsersId : Maybe String
+    , signUpStatus : SignUpStatus
 
     -- Home stuff
     , selectedReportIds : List ReportId
@@ -139,6 +137,11 @@ type alias ReportId =
     Int
 
 
+type SignUpStatus
+    = SignUpStatusDefault
+    | SignUpStatusConfirmationRequired
+
+
 init : () -> Url -> Key -> ( Model, Cmd Msg )
 init _ url key =
     ( { url = url
@@ -148,9 +151,8 @@ init _ url key =
       , currentPage = urlToPage url
       , email = "azurewaters@gmail.com"
       , password = "QcGmuuQgpEKpnsSpIqir"
-      , loginErrors = []
-      , signUpErrors = []
       , currentUsersId = Nothing
+      , signUpStatus = SignUpStatusDefault
       , selectedReportIds = []
       , showDeleteReportsConfirmation = False
       , reports = []
@@ -168,7 +170,7 @@ type Msg
     | GotTheTimeZone Zone
     | DoNothing (Result Http.Error ())
     | NoOp
-    | DelistErrors
+    | DelistErrors Errors
       --  Login and registration messages
     | EmailTyped String
     | PasswordTyped String
@@ -176,7 +178,7 @@ type Msg
     | SignUpClicked
     | UserSignedIn (Result Http.Error AccessDetails)
     | FetchedUploadedFiles (Result Http.Error (List Report))
-    | UserSignedUp (Result Http.Error String)
+    | UserSignedUp (Result Http.Error (List String)) -- Identities
       -- Home messages
     | GoToLoginPageClicked
     | LogOutClicked
@@ -225,20 +227,37 @@ update msg model =
         LogInClicked ->
             case Validate.validate loginValidator model of
                 Ok _ ->
-                    ( { model | loginErrors = [] }, signInAUser model.email model.password )
+                    ( model, signInAUser model.email model.password )
 
                 Err errors ->
-                    ( { model | loginErrors = errors }, Cmd.none )
+                    ( { model | errors = errors }, pauseAndDelistErrors errors )
 
         SignUpClicked ->
             case Validate.validate signUpValidator model of
                 Ok _ ->
-                    ( { model | signUpErrors = [] }
-                    , signUpAUser model.email model.password
+                    ( model
+                    , Http.request
+                        { method = "POST"
+                        , url = supabaseURL ++ "/auth/v1/signup"
+                        , headers =
+                            [ header "apikey" supabaseAnonymousToken
+                            , header "Content-Type" "application/json"
+                            ]
+                        , body =
+                            Http.jsonBody
+                                (Encode.object
+                                    [ ( "email", Encode.string model.email )
+                                    , ( "password", Encode.string model.password )
+                                    ]
+                                )
+                        , expect = Http.expectJson UserSignedUp signUpResponseDecoder
+                        , timeout = Nothing
+                        , tracker = Nothing
+                        }
                     )
 
                 Err errors ->
-                    ( { model | signUpErrors = errors }, Cmd.none )
+                    ( { model | errors = errors }, pauseAndDelistErrors errors )
 
         UserSignedIn result ->
             case result of
@@ -255,7 +274,11 @@ update msg model =
                     )
 
                 Err _ ->
-                    ( { model | loginErrors = "Unable to log in" :: model.loginErrors }, Cmd.none )
+                    let
+                        error =
+                            "Unable to log in"
+                    in
+                    ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
         FetchedUploadedFiles value ->
             case value of
@@ -265,8 +288,28 @@ update msg model =
                 Err err ->
                     ( Debug.log (Debug.toString err) model, Cmd.none )
 
-        UserSignedUp value ->
-            ( Debug.log (Debug.toString value) model, Cmd.none )
+        UserSignedUp result ->
+            case result of
+                Ok ids ->
+                    case ids of
+                        [] ->
+                            --  There was a problem signing up. Most likely, this user already exists.
+                            let
+                                error =
+                                    "Couldn't sign you up. Try logging in."
+                            in
+                            ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
+
+                        _ ->
+                            --  Signed up fine. The user needs to be told to confirm their email.
+                            ( { model | signUpStatus = SignUpStatusConfirmationRequired }, Cmd.none )
+
+                Err e ->
+                    let
+                        error =
+                            getHttpErrorToDisplay e
+                    in
+                    ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
         GoToLoginPageClicked ->
             ( { model | currentPage = Login }, Navigation.pushUrl model.key "login" )
@@ -291,7 +334,7 @@ update msg model =
             ( { model | currentPage = Top }, Navigation.pushUrl model.key "/" )
 
         ChooseFilesClicked ->
-            ( model, File.Select.files [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ] FilesSelected )
+            ( model, File.Select.files [ "*/*" ] FilesSelected )
 
         FilesSelected file files ->
             let
@@ -323,7 +366,24 @@ update msg model =
             let
                 requestsToDelete : List (Cmd Msg)
                 requestsToDelete =
-                    List.map (makeDeleteReportRequest model.supabaseAuthorisedToken) model.selectedReportIds
+                    List.map
+                        (\reportId ->
+                            request
+                                { method = "DELETE"
+                                , headers =
+                                    [ header "apiKey" supabaseAnonymousToken
+                                    , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+
+                                    -- , header "returning" "minimal"
+                                    ]
+                                , url = supabaseURL ++ "/rest/v1/reports?id=eq." ++ String.fromInt reportId
+                                , body = Http.emptyBody
+                                , expect = expectWhatever (ReportDeleted reportId)
+                                , timeout = Nothing
+                                , tracker = Nothing
+                                }
+                        )
+                        model.selectedReportIds
             in
             ( { model | showDeleteReportsConfirmation = False, selectedReportIds = [] }
             , Cmd.batch requestsToDelete
@@ -370,9 +430,6 @@ update msg model =
 
         DownloadClicked ->
             --  This is where we start the process of downloading selected reports' files
-            --  Two step procedure:
-            --      Generate a pre-signed URL
-            --      Download that file with File.download
             let
                 commands =
                     case model.reports of
@@ -391,8 +448,8 @@ update msg model =
                                                 , Http.header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
                                                 ]
                                             , url = supabaseURL ++ "/storage/v1/object/authenticated/reports/" ++ Maybe.withDefault "" model.currentUsersId ++ "/" ++ r.name
-                                            , body = Http.emptyBody
-                                            , expect = Http.expectBytesResponse (DownloadedFile r.id) (resolveResponse Ok)
+                                            , body = emptyBody
+                                            , expect = expectBytesResponse (DownloadedFile r.id) (resolveResponse Ok)
                                             , timeout = Nothing
                                             , tracker = Nothing
                                             }
@@ -509,11 +566,21 @@ update msg model =
                 Err e ->
                     ( Debug.log (Debug.toString e) model, Cmd.none )
 
-        DelistErrors ->
-            ( { model | errors = [] }, Cmd.none )
+        DelistErrors errorsToDelist ->
+            let
+                newErrors =
+                    Set.diff (Set.fromList model.errors) (Set.fromList errorsToDelist)
+                        |> Set.toList
+            in
+            ( { model | errors = newErrors }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
+
+
+pauseAndDelistErrors : Errors -> Cmd Msg
+pauseAndDelistErrors errors =
+    Task.perform (\_ -> DelistErrors errors) (Process.sleep 5000)
 
 
 resolveResponse : (body -> Result String a) -> Http.Response body -> Result Http.Error a
@@ -538,10 +605,6 @@ resolveResponse toResult response =
 uploadTheseFiles : List File -> Model -> ( Model, Cmd Msg )
 uploadTheseFiles files model =
     let
-        imageFiles : List File
-        imageFiles =
-            List.filter itIsAnImage files
-
         namesOfFilesAlreadyBeingUploaded : List String
         namesOfFilesAlreadyBeingUploaded =
             model.filesBeingUploaded
@@ -566,15 +629,21 @@ uploadTheseFiles files model =
         fileNamesToCheckAgainst =
             List.concat [ namesOfFilesAlreadyBeingUploaded, namesOfReportsFiles ]
 
-        uniqueImageFiles : List File
-        uniqueImageFiles =
-            List.filter
-                (\file -> not <| List.member (File.name file) fileNamesToCheckAgainst)
-                imageFiles
+        filesThatCanBeUploaded : List File
+        filesThatCanBeUploaded =
+            files
+                --  Files that have been or are being uploaded will be rejected
+                |> List.filter (\file -> not <| List.member (File.name file) fileNamesToCheckAgainst)
+                --  Files that are too large are rejected
+                |> List.filter (\file -> File.size file < (50 * 1000 * 1000))
+                --  Files that have unsafe characters in their names will be rejected
+                |> List.filter (\file -> File.name file |> charactersAreAWSSafe)
 
         idsToUse : List Int
         idsToUse =
-            List.range model.lastUsedIndexNumberForFilesBeingUploaded (model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles)
+            List.range
+                model.lastUsedIndexNumberForFilesBeingUploaded
+                (model.lastUsedIndexNumberForFilesBeingUploaded + List.length filesThatCanBeUploaded)
 
         newFilesBeingUploaded : List FileBeingUploaded
         newFilesBeingUploaded =
@@ -586,47 +655,57 @@ uploadTheseFiles files model =
                     }
                 )
                 idsToUse
-                uniqueImageFiles
+                filesThatCanBeUploaded
 
         commandsToUploadTheFiles : List (Cmd Msg)
         commandsToUploadTheFiles =
             List.map
-                (makeFileUploadRequest model.supabaseAuthorisedToken (Maybe.withDefault "" model.currentUsersId))
+                (\fileBeingUploaded ->
+                    request
+                        { method = "POST"
+                        , url = supabaseURL ++ "/storage/v1/object/reports/" ++ Maybe.withDefault "" model.currentUsersId ++ "/" ++ File.name fileBeingUploaded.file
+                        , headers =
+                            [ header "apiKey" supabaseAnonymousToken
+                            , header "Authorization" ("Bearer " ++ model.supabaseAuthorisedToken)
+                            ]
+                        , body = fileBody fileBeingUploaded.file
+                        , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
+                        , timeout = Nothing
+                        , tracker = Just <| String.fromInt fileBeingUploaded.id
+                        }
+                )
                 newFilesBeingUploaded
 
-        -- Now find the errors
-        --  First, the files that aren't images
-        --  Second, the files that are already being uploaded
-        fileNames : Set String
-        fileNames =
-            List.map File.name files
-                |> Set.fromList
+        errorsAboutFileNamesWithUnsafeCharacters : List String
+        errorsAboutFileNamesWithUnsafeCharacters =
+            files
+                |> List.filter (\file -> File.name file |> charactersAreAWSSafe |> not)
+                |> List.map (\file -> "The file name of '" ++ File.name file ++ "' uses characters that aren't safe on the server. Please rename the file and try again.")
 
-        errorsAboutFilesThatArentImages : List String
-        errorsAboutFilesThatArentImages =
-            let
-                imageFileNames =
-                    Set.fromList <| List.map File.name imageFiles
-            in
-            Set.diff fileNames imageFileNames
-                |> Set.map (\fn -> "The file '" ++ fn ++ "' is not an image and won't be uploaded.")
-                |> Set.toList
+        errorsAboutFilesBeingTooLarge : List String
+        errorsAboutFilesBeingTooLarge =
+            files
+                |> List.filter (\file -> File.size file > (50 * 1000 * 1000))
+                |> List.map (\file -> "The file '" ++ File.name file ++ "' is too large and won't be uploaded.")
 
         errorsAboutFilesThatAreAlreadyOnRecord : List String
         errorsAboutFilesThatAreAlreadyOnRecord =
-            Set.intersect (Set.fromList fileNamesToCheckAgainst) fileNames
+            Set.intersect
+                (Set.fromList fileNamesToCheckAgainst)
+                (Set.fromList <| List.map File.name files)
                 |> Set.map (\fn -> "The file '" ++ fn ++ "' is a duplicate and won't be uploaded.")
                 |> Set.toList
+
+        allErrors : List String
+        allErrors =
+            List.concat [ errorsAboutFileNamesWithUnsafeCharacters, errorsAboutFilesBeingTooLarge, errorsAboutFilesThatAreAlreadyOnRecord ]
     in
     ( { model
         | filesBeingUploaded = List.append model.filesBeingUploaded newFilesBeingUploaded
-        , errors = List.concat [ model.errors, errorsAboutFilesThatArentImages, errorsAboutFilesThatAreAlreadyOnRecord ]
-        , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length uniqueImageFiles
+        , errors = List.concat [ model.errors, allErrors ]
+        , lastUsedIndexNumberForFilesBeingUploaded = model.lastUsedIndexNumberForFilesBeingUploaded + List.length filesThatCanBeUploaded
       }
-    , Cmd.batch <|
-        List.append
-            commandsToUploadTheFiles
-            [ Process.sleep 3000 |> Task.perform (\_ -> DelistErrors) ]
+    , Cmd.batch (pauseAndDelistErrors allErrors :: commandsToUploadTheFiles)
     )
 
 
@@ -662,51 +741,12 @@ getHttpErrorToDisplay err =
             "An unexpected problem occurred. Please try again or report this error. Additional information: " ++ explanation
 
 
-makeDeleteReportRequest : String -> ReportId -> Cmd Msg
-makeDeleteReportRequest supabaseAuthorisedToken reportId =
-    request
-        { method = "DELETE"
-        , headers =
-            [ header "apiKey" supabaseAnonymousToken
-            , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
-
-            -- , header "returning" "minimal"
-            ]
-        , url = supabaseURL ++ "/rest/v1/reports?id=eq." ++ String.fromInt reportId
-        , body = Http.emptyBody
-        , expect = expectWhatever (ReportDeleted reportId)
-        , timeout = Nothing
-        , tracker = Nothing
-        }
-
-
-itIsAnImage : File -> Bool
-itIsAnImage =
-    \file -> List.member (File.mime file) [ "image/jpg", "image/jpeg", "image/png", "application/pdf" ]
-
-
-checkIfCharactersAreAWSSafe : String -> Bool
-checkIfCharactersAreAWSSafe s =
-    -- Unsafe character names have to be checked
-    [ "\\", "{", "^", "}", "%", "`", "]", "\"", "'", ">", "[", "~", "<", "#", "|" ]
-        |> List.map (\c -> String.contains c s)
+charactersAreAWSSafe : String -> Bool
+charactersAreAWSSafe s =
+    -- If the string contains any of the below characters, it is unsafe
+    [ "\\", "{", "^", "}", "%", "`", "]", "\"", "'", ">", "[", "~", "<", "#", "|", "’" ]
+        |> List.map (\c -> String.contains c s |> not)
         |> List.foldl (&&) True
-
-
-makeFileUploadRequest : String -> String -> FileBeingUploaded -> Cmd Msg
-makeFileUploadRequest supabaseAuthorisedToken userId fileBeingUploaded =
-    request
-        { method = "POST"
-        , url = supabaseURL ++ "/storage/v1/object/reports/" ++ userId ++ "/" ++ File.name fileBeingUploaded.file
-        , headers =
-            [ header "apiKey" supabaseAnonymousToken
-            , header "Authorization" ("Bearer " ++ supabaseAuthorisedToken)
-            ]
-        , body = fileBody fileBeingUploaded.file
-        , expect = expectJson (FileUploaded fileBeingUploaded) fileUploadedResponseDecoder
-        , timeout = Nothing
-        , tracker = Just <| String.fromInt fileBeingUploaded.id
-        }
 
 
 fileUploadedResponseDecoder : Decoder FileUploadedResponse
@@ -729,7 +769,7 @@ updateFilesBeingUploaded filesBeingUploaded id updateFunction =
 
 loginValidator : Validator String Model
 loginValidator =
-    Validate.firstError
+    Validate.all
         [ Validate.ifBlank .email "Please type in your email"
         , Validate.ifBlank .password "Please type in your password"
         , Validate.ifInvalidEmail .email (\_ -> "Please enter a valid email")
@@ -738,10 +778,11 @@ loginValidator =
 
 signUpValidator : Validator String Model
 signUpValidator =
-    Validate.firstError
+    Validate.all
         [ Validate.ifBlank .email "Please type in your email"
         , Validate.ifBlank .password "Please type in your name"
         , Validate.ifInvalidEmail .email (\_ -> "Please enter a valid email")
+        , Validate.ifTrue (\model -> String.length model.password < 6) "Please use at least 6 characters for your password"
         ]
 
 
@@ -767,26 +808,19 @@ signInAUser email password =
         }
 
 
-signUpAUser : String -> String -> Cmd Msg
-signUpAUser email password =
-    Http.request
-        { method = "POST"
-        , url = supabaseURL ++ "/auth/v1/signup"
-        , headers =
-            [ header "apikey" supabaseAnonymousToken
-            , header "Content-Type" "application/json"
-            ]
-        , body =
-            Http.jsonBody
-                (Encode.object
-                    [ ( "email", Encode.string email )
-                    , ( "password", Encode.string password )
-                    ]
-                )
-        , expect = Http.expectJson UserSignedUp accessTokenDecoder
-        , timeout = Nothing
-        , tracker = Nothing
-        }
+signUpResponseDecoder : Decoder (List String)
+signUpResponseDecoder =
+    field "identities" identitiesDecoder
+
+
+identitiesDecoder : Decoder (List String)
+identitiesDecoder =
+    Decode.list idDecoder
+
+
+idDecoder : Decoder String
+idDecoder =
+    field "id" string
 
 
 accessTokenDecoder : Decoder String
@@ -879,7 +913,15 @@ view model =
 
 top : List (Html Msg)
 top =
-    [ h1 [] [ text "Hello" ], div [] [ text "This is the company's page" ] ]
+    [ div
+        [ class "h-full grid gap-8 auto-cols-min justify-center items-center text-center content-center" ]
+        [ div []
+            [ div [ class "font-serif text-9xl" ] [ text "Bureau" ]
+            , div [ class "text-xl" ] [ div [] [ text "Store your health records online for free. Access them anytime." ] ]
+            ]
+        , a [ href "/signup", class "btn w-full" ] [ text "Sign up or Log in" ]
+        ]
+    ]
 
 
 notFound : List (Html Msg)
@@ -893,18 +935,26 @@ logIn model =
         [ class "w-full h-full grid justify-center content-center" ]
         [ div
             [ cardClasses ]
-            [ div
-                [ class "card-body" ]
-                [ h2 [ class "card-title" ] [ text "Log in" ]
-                , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
-                , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
-                , div [ class "card-actions justify-between items-center" ]
-                    [ a [ href "/signup" ] [ text "Sign up" ]
-                    , button [ onClick LogInClicked, class "btn btn-primary" ] [ text "Log in" ]
-                    ]
-                , div [] (List.map (\error -> div [] [ text error ]) model.loginErrors)
+            (List.concat
+                [ [ div
+                        [ class "card-body" ]
+                        [ h2 [ class "card-title" ] [ text "Log in" ]
+                        , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
+                        , input [ type_ "password", required True, placeholder "Your password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
+                        , div
+                            [ class "card-actions justify-between items-center" ]
+                            [ a [ href "/signup" ] [ text "Sign up" ]
+                            , button [ onClick LogInClicked, class "btn btn-primary" ] [ text "Log in" ]
+                            ]
+                        ]
+                  ]
+                , if List.length model.errors == 0 then
+                    []
+
+                  else
+                    [ errorsDisplay model.errors ]
                 ]
-            ]
+            )
         ]
     ]
 
@@ -915,19 +965,43 @@ signUp model =
         [ class "w-full h-full grid justify-center content-center" ]
         [ div
             [ cardClasses ]
-            [ div [ class "card-body" ]
+            [ div
+                [ class "card-body" ]
                 [ h2 [ class "card-title" ] [ text "Sign up" ]
-                , input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
-                , input [ type_ "password", required True, placeholder "Set a password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
                 , div
-                    [ class "card-actions justify-between items-center" ]
-                    [ a [ href "/login" ] [ text "Log in" ]
-                    , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
-                    ]
+                    [ class "w-full grid grid-cols-1 gap-2" ]
+                    (case model.signUpStatus of
+                        SignUpStatusDefault ->
+                            signUpDefault model
+
+                        SignUpStatusConfirmationRequired ->
+                            signUpConfirmationRequired
+                    )
                 ]
-            , div [ class "m-4" ] (List.map (\error -> div [] [ text error ]) model.signUpErrors)
+            , errorsDisplay model.errors
             ]
         ]
+    ]
+
+
+signUpDefault : Model -> List (Html Msg)
+signUpDefault model =
+    [ input [ type_ "email", required True, placeholder "Your email address", class "input input-bordered", onInput EmailTyped, value model.email ] []
+    , input [ type_ "password", required True, placeholder "Set a password", class "input input-bordered", onInput PasswordTyped, value model.password ] []
+    , div
+        [ class "card-actions justify-between items-center" ]
+        [ a [ href "/login" ] [ text "Log in" ]
+        , button [ onClick SignUpClicked, class "btn btn-primary" ] [ text "Sign up" ]
+        ]
+    ]
+
+
+signUpConfirmationRequired : List (Html Msg)
+signUpConfirmationRequired =
+    [ div [ class "w-fit" ] [ text "We've sent you a confirmation email. Please click the confirmation link and then try logging in." ]
+    , div
+        [ class "card-actions justify-end" ]
+        [ a [ class "btn btn-primary", href "/login" ] [ text "Log in" ] ]
     ]
 
 

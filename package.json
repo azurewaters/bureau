@@ -20,10 +20,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@microsoft/fast-element": "^1.10.2",
     "daisyui": "^2.17.0",
-    "firebase": "^9.6.11",
-    "pdfjs-dist": "^2.14.305",
     "vite": "^2.9.13",
     "vite-plugin-elm": "^2.6.1"
   }
