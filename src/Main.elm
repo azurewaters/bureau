@@ -285,8 +285,12 @@ update msg model =
                 Ok result ->
                     ( { model | reports = result }, Cmd.none )
 
-                Err err ->
-                    ( Debug.log (Debug.toString err) model, Cmd.none )
+                Err e ->
+                    let
+                        error =
+                            getHttpErrorToDisplay e
+                    in
+                    ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
         UserSignedUp result ->
             case result of
@@ -423,9 +427,13 @@ update msg model =
                     , Maybe.withDefault Cmd.none maybeRequestToRemoveFromStorage
                     )
 
-                Err error ->
-                    ( { model | errors = ("Report " ++ String.fromInt reportId ++ " could not be uploaded. The error reported was " ++ Debug.log (Debug.toString error) "") :: model.errors }
-                    , Cmd.none
+                Err e ->
+                    let
+                        error =
+                            getHttpErrorToDisplay e
+                    in
+                    ( { model | errors = error :: model.errors }
+                    , pauseAndDelistErrors [ error ]
                     )
 
         DownloadClicked ->
@@ -460,7 +468,7 @@ update msg model =
 
         DownloadedFile reportId result ->
             let
-                command =
+                ( newModel, newCommand ) =
                     model.reports
                         |> List.filter (\r -> r.id == reportId)
                         |> List.head
@@ -469,16 +477,24 @@ update msg model =
                                     Just report ->
                                         case result of
                                             Ok bytes ->
-                                                File.Download.bytes report.name report.mime bytes
+                                                ( model, File.Download.bytes report.name report.mime bytes )
 
                                             Err err ->
-                                                Debug.log (Debug.toString err) Cmd.none
+                                                let
+                                                    error =
+                                                        getHttpErrorToDisplay err
+                                                in
+                                                ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
                                     Nothing ->
-                                        Cmd.none
+                                        let
+                                            error =
+                                                "An unexpected error occurred when trying to download the report. Please try again or report the error."
+                                        in
+                                        ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
                            )
             in
-            ( model, command )
+            ( newModel, newCommand )
 
         FilesDropped files ->
             let
@@ -556,7 +572,11 @@ update msg model =
                     ( { model | reports = List.append model.reports reports }, Cmd.none )
 
                 Err e ->
-                    ( Debug.log ("InsertedUploadedFilesDetails - " ++ Debug.toString e) model, Cmd.none )
+                    let
+                        error =
+                            getHttpErrorToDisplay e
+                    in
+                    ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
         IgnoreSuccessfulHttpRequests result ->
             case result of
@@ -564,7 +584,11 @@ update msg model =
                     ( model, Cmd.none )
 
                 Err e ->
-                    ( Debug.log (Debug.toString e) model, Cmd.none )
+                    let
+                        error =
+                            getHttpErrorToDisplay e
+                    in
+                    ( { model | errors = error :: model.errors }, pauseAndDelistErrors [ error ] )
 
         DelistErrors errorsToDelist ->
             let
